@@ -1,0 +1,9 @@
+[build]
+target = "aarch64-unknown-none-softfloat"
+
+[target.aarch64-unknown-none-softfloat]
+runner = "qemu-system-aarch64 -M virt -cpu cortex-a57 -nographic -kernel"
+
+[alias]
+kbuild = "build --package kernel"
+krun = "run --package kernel"
