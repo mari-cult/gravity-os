@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:nixos/nixpkgs";
   };
 
   outputs =
@@ -18,33 +18,26 @@
     {
       devShells = eachSystem (
         system: with nixpkgs.legacyPackages.${system}; {
-          default =
-            (mkShell.override {
-              stdenv = useWildLinker clangStdenv;
-            })
-              rec {
-                nativeBuildInputs = [
-                  pyrefly
-                  (rustup.overrideAttrs (old: {
-                    doCheck = false;
-                  }))
-                  pkg-config
-                  nixfmt-rfc-style
-                  nil
-                  python3
-                  wild
-                ];
+          default = buildFHSEnv rec {
+            name = "dev";
+            nativeBuildInputs = with buildPackages; [
+              dotslash
+              rust-cbindgen
+              rust-bindgen
+              rustup
+              nixfmt
+              nil
+              ty
+              python3
+              llvmPackages.lld
+              llvmPackages.clangUseLLVM
+            ];
 
-                buildInputs = [
-                  wayland
-                  alsa-lib
-                  libxkbcommon
-                  vulkan-loader
-                ];
+            buildInputs = [
+            ];
 
-                RUSTC_BOOTSTRAP = 1;
-                LD_LIBRARY_PATH = lib.makeLibraryPath buildInputs;
-              };
+            LD_LIBRARY_PATH = lib.makeLibraryPath buildInputs;
+          };
         }
       );
     };

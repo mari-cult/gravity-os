@@ -1,0 +1,50 @@
+load("@prelude//toolchains:cxx.bzl", "system_cxx_toolchain")
+load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
+load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain")
+load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
+
+system_cxx_toolchain(
+    name = "cxx",
+    visibility = ["PUBLIC"],
+    linker = select({
+        "config//os:none": select({
+            "config//cpu:x86_64": "ld.lld",
+            "config//cpu:arm64": "ld.lld",
+        }),
+        "DEFAULT": "clang++",
+    })
+)
+    
+system_genrule_toolchain(
+    name = "genrule",
+    visibility = ["PUBLIC"],
+)
+
+system_python_bootstrap_toolchain(
+    name = "python_bootstrap",
+    visibility = ["PUBLIC"],
+)
+
+system_rust_toolchain(
+    name = "rust",
+    visibility = ["PUBLIC"],
+    default_edition = "2024",
+    rustc_target_triple = select({
+        "config//os:none": select({
+            "config//cpu:x86_64": "x86_64-unknown-none",
+            "config//cpu:arm64": "aarch64-unknown-none",
+        }),
+        "DEFAULT": None,
+    }),
+)
+
+
+load("@prelude//platforms:defs.bzl", "execution_platform", "host_configuration")
+
+execution_platform(
+    name = "embedded",
+    cpu_configuration = "config//cpu:arm64",
+    os_configuration = "config//os:none",
+    use_windows_path_separators = host_info().os.is_windows,
+    visibility = ["PUBLIC"],
+)

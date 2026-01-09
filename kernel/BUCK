@@ -1,0 +1,13 @@
+rust_binary(
+    name = "kernel",
+    srcs = glob(["src/*.rs", "src/*.s"]),
+    deps = [
+        "//third-party:goblin",
+        "//third-party:linked_list_allocator",
+        "//third-party:spin",
+    ],
+    target_compatible_with = [
+        "config//os:none",
+        "config//cpu:arm64",
+    ],
+)
