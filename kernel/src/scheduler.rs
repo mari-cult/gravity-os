@@ -1,8 +1,11 @@
 use crate::kprintln;
 use crate::process::CpuContext;
+use crate::ipc::IpcSpace;
+use crate::vfs::FileHandle;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use alloc::vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
@@ -21,6 +24,8 @@ pub struct Process {
     pub context: CpuContext,
     pub stack: Vec<u8>,
     pub is_aarch32: bool,
+    pub ipc_space: IpcSpace,
+    pub files: Vec<Option<FileHandle>>,
 }
 
 impl Process {
@@ -79,6 +84,8 @@ impl Process {
             context,
             stack,
             is_aarch32: is_a32,
+            ipc_space: IpcSpace::new(),
+            files: (0..32).map(|_| None).collect(),
         }
     }
 

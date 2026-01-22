@@ -67,13 +67,17 @@ sync_handler:
 
     mrs x10, elr_el1
     mrs x11, spsr_el1
+    mrs x12, sp_el0
     stp x10, x11, [sp, #16 * 16]
+    str x12, [sp, #272]
     
     /* Pass trap frame to Rust */
     mov x0, sp
     bl handle_sync_exception
 
     /* Restore context */
+    ldr x12, [sp, #272]
+    msr sp_el0, x12
     ldp x10, x11, [sp, #16 * 16]
     msr elr_el1, x10
     msr spsr_el1, x11

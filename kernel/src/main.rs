@@ -6,6 +6,7 @@ extern crate alloc;
 
 mod elf;
 mod heap;
+mod ipc;
 mod macho;
 mod mmu;
 mod process;
@@ -45,59 +46,35 @@ pub extern "C" fn kmain() {
     let mut shared_cache_data: &[u8] = &[];
 
     if let Some(mut blk) = virtio::init() {
-        kprintln!("Loading shared cache from disk...");
+        kprintln!("VirtIO disk found, loading shared cache...");
 
-        // Shared cache is at sector 0, ~200MB (actual is ~190MB)
+        // Shared cache is at sector 0, ~200MB
         const SHARED_CACHE_SIZE: usize = 200 * 1024 * 1024;
+        const SHARED_CACHE_PHYS: u64 = 0x5000_0000;
 
-        const SHARED_CACHE_SECTORS: usize = SHARED_CACHE_SIZE / 512;
-
-        // Allocate page-aligned buffer (4KB alignment) to ensure correct MMU mapping
-        use alloc::alloc::{Layout, alloc_zeroed};
-        let layout = Layout::from_size_align(SHARED_CACHE_SIZE, 4096).unwrap();
-        let cache_ptr = unsafe { alloc_zeroed(layout) };
-        if cache_ptr.is_null() {
-            panic!("Failed to allocate shared cache buffer");
-        }
-
-        // Create a Vec from the raw allocation for reading
-        let mut cache_buf = unsafe {
-            alloc::vec::Vec::from_raw_parts(cache_ptr, SHARED_CACHE_SIZE, SHARED_CACHE_SIZE)
+        let cache_buf = unsafe {
+            core::slice::from_raw_parts_mut(SHARED_CACHE_PHYS as *mut u8, SHARED_CACHE_SIZE)
         };
 
-        if blk.read_sectors(0, &mut cache_buf) {
+        if blk.read_sectors(0, cache_buf) {
             kprintln!(
-                "Shared cache loaded ({} bytes, aligned to {:x})",
+                "Shared cache loaded ({} bytes at phys {:x})",
                 SHARED_CACHE_SIZE,
-                cache_buf.as_ptr() as usize
+                SHARED_CACHE_PHYS
             );
-            // Map shared cache to its expected address (0x2fe00000 area)
-            // For now, store in a static location
-            static mut SHARED_CACHE_STORAGE: Option<alloc::vec::Vec<u8>> = None;
-            unsafe {
-                SHARED_CACHE_STORAGE = Some(cache_buf);
-                if let Some(ref data) = SHARED_CACHE_STORAGE {
-                    shared_cache_data = data.as_slice();
-                }
-            }
+            shared_cache_data = cache_buf;
         } else {
             kprintln!("Failed to read shared cache from disk");
         }
 
-        // Load rootfs.tar from disk (at 400MB offset)
-        const ROOTFS_OFFSET: u64 = 400 * 1024 * 1024 / 512;
-        const ROOTFS_SIZE: usize = 50 * 1024 * 1024; // 50MB max
-        const ROOTFS_SECTORS: usize = ROOTFS_SIZE / 512;
-
-        let mut rootfs_buf = vec![0u8; ROOTFS_SIZE];
-        if blk.read_sectors(ROOTFS_OFFSET, &mut rootfs_buf) {
-            kprintln!("Rootfs loaded, initializing VFS...");
-            let tarfs = tarfs::TarFs::new(rootfs_buf);
-            kprintln!("Found {} files in rootfs", tarfs.list().len());
-            vfs::init(tarfs);
-        }
+        // Initialize VFS from disk (at 400MB offset)
+        kprintln!("Initializing VFS from disk...");
+        let blk_shared = alloc::sync::Arc::new(spin::Mutex::new(blk));
+        let tarfs = tarfs::TarFs::new(blk_shared, 400 * 1024 * 1024);
+        kprintln!("Found {} files in rootfs", tarfs.list().len());
+        vfs::init(tarfs);
     } else {
-        kprintln!("No virtio disk found, using embedded binaries");
+        kprintln!("No virtio disk found");
     }
 
     // iOS 5 ARMv7 Darwin executables
@@ -109,7 +86,7 @@ pub extern "C" fn kmain() {
     }
 
     // Note: 0x40000000 seems to be used by dyld for CommPage or similar absolute reference.
-    // We move the app to 0x5000_0000.
+    // We move the app to 0x4000_0000.
     let load_offset = 0x3FFF_F000;
     kprintln!("Using load_offset: {:x}", load_offset);
 
@@ -126,6 +103,13 @@ pub extern "C" fn kmain() {
         unsafe {
             let version_ptr = &mut crate::mmu::COMMPAGE_STORAGE[0x1E] as *mut u8 as *mut u16;
             *version_ptr = 13;
+            
+            // Set ncpus at 0x22 (u8)
+            crate::mmu::COMMPAGE_STORAGE[0x22] = 1;
+            
+            // Set pagesize at 0x24 (u32)
+            let pgsize_ptr = &mut crate::mmu::COMMPAGE_STORAGE[0x24] as *mut u8 as *mut u32;
+            *pgsize_ptr = 4096;
         }
 
         let sc_addr = 0x3000_0000u32;
@@ -193,13 +177,14 @@ pub extern "C" fn kmain() {
             new_sp + 20,        // r5: apple
         ];
 
-        // Allocate TLS page (4KB)
-        let (tls_base, _, tls_size) = {
+        // Allocate TLS page (4KB), ensuring 4KB alignment
+        let (tls_base, tls_size) = {
             let size = 4096;
-            let buf = vec![0u8; size];
-            let base = buf.as_ptr() as u64;
-            core::mem::forget(buf);
-            (base, base + size as u64, size)
+            use alloc::alloc::{Layout, alloc_zeroed};
+            let layout = Layout::from_size_align(size, 4096).unwrap();
+            let ptr = unsafe { alloc_zeroed(layout) };
+            if ptr.is_null() { panic!("Failed to allocate TLS"); }
+            (ptr as u64, size)
         };
         crate::mmu::map_range(
             tls_base,
@@ -207,6 +192,7 @@ pub extern "C" fn kmain() {
             tls_size as u64,
             crate::mmu::MapPermission::UserRW,
         );
+        kprintln!("Mapped TLS at {:x}", tls_base);
         // Fill TLS with some pattern if needed, but 0 is usually fine for initial state.
         // dyld expects [tls] to point to itself? The crash was ldr r1, [r1].
         // If r1 spans 0, crash. If r1 points to tls_base, ldr r1, [tls_base] loads first word.

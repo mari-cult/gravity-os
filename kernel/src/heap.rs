@@ -4,7 +4,7 @@ use linked_list_allocator::LockedHeap;
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 pub fn init_heap() {
-    let heap_start = 0x5000_0000u64;
+    let heap_start = 0xA000_0000u64;
     let heap_size = 512 * 1024 * 1024; // 512MiB
     crate::kprintln!(
         "Initializing heap at {:x} (size {:x})",

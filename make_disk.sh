@@ -25,6 +25,7 @@ echo "Creating rootfs.tar..."
 ROOTFS_DIR="rootfs"
 mkdir -p "$ROOTFS_DIR/bin"
 mkdir -p "$ROOTFS_DIR/usr/lib"
+mkdir -p "$ROOTFS_DIR/System/Library"
 
 # Copy some binaries
 if [ -d "$IOS_ROOT" ]; then
@@ -32,10 +33,13 @@ if [ -d "$IOS_ROOT" ]; then
     cp "$IOS_ROOT/bin/cat" "$ROOTFS_DIR/bin/" 2>/dev/null || true
     cp "$IOS_ROOT/bin/echo" "$ROOTFS_DIR/bin/" 2>/dev/null || true
     cp "$IOS_ROOT/usr/lib/dyld" "$ROOTFS_DIR/usr/lib/" 2>/dev/null || true
+    
+    echo "Copying Frameworks..."
+    cp -r "$IOS_ROOT/System/Library/Frameworks" "$ROOTFS_DIR/System/Library/" 2>/dev/null || true
 fi
 
 # Create tar archive
-tar cf rootfs.tar -C "$ROOTFS_DIR" .
+tar -chf rootfs.tar -C "$ROOTFS_DIR" .
 echo "Rootfs created ($(stat -f%z rootfs.tar) bytes)"
 
 # Write rootfs at 400MB offset

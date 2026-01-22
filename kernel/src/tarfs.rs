@@ -1,9 +1,15 @@
 //! Simple TAR filesystem reader (ustar format)
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use alloc::vec;
+use alloc::sync::Arc;
 
-const TAR_BLOCK_SIZE: usize = 512;
+/// Trait for reading from a block device
+pub trait BlockReader: Send + Sync {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> bool;
+}
 
 #[repr(C)]
 struct TarHeader {
@@ -26,81 +32,180 @@ struct TarHeader {
     _pad: [u8; 12],
 }
 
+#[derive(Clone)]
 pub struct TarFile {
     pub name: String,
     pub size: usize,
-    pub data_offset: usize,
+    pub data_offset: u64, // Absolute byte offset
 }
 
 pub struct TarFs {
-    data: Vec<u8>,
+    device: Arc<dyn BlockReader>,
+    base_offset: u64,
     files: Vec<TarFile>,
 }
 
 impl TarFs {
-    /// Create a new TarFs from raw data
-    pub fn new(data: Vec<u8>) -> Self {
-        let mut fs = Self {
-            data,
-            files: Vec::new(),
-        };
-        fs.parse();
-        fs
-    }
+    /// Create a new TarFs from a block reader
+    pub fn new(device: Arc<dyn BlockReader>, base_offset: u64) -> Self {
+        let mut files = Vec::new();
+        let mut current_offset = 0u64;
+        let mut header_buf = [0u8; 512];
 
-    fn parse(&mut self) {
-        let mut offset = 0;
+        loop {
+            if !device.read_at(base_offset + current_offset, &mut header_buf) {
+                break;
+            }
 
-        while offset + TAR_BLOCK_SIZE <= self.data.len() {
-            let header = unsafe { &*(self.data.as_ptr().add(offset) as *const TarHeader) };
+            let header = unsafe { &*(header_buf.as_ptr() as *const TarHeader) };
 
-            // Check for end of archive (all zeros)
             if header.name[0] == 0 {
                 break;
             }
 
-            // Parse name
             let name_end = header.name.iter().position(|&b| b == 0).unwrap_or(100);
-            let name = String::from_utf8_lossy(&header.name[..name_end]).into_owned();
+            let mut name = String::from_utf8_lossy(&header.name[..name_end]).into_owned();
+            
+            if header.magic[0] == b'u' && header.magic[1] == b's' && header.magic[2] == b't' && header.magic[3] == b'a' && header.magic[4] == b'r' {
+                 let prefix_end = header.prefix.iter().position(|&b| b == 0).unwrap_or(155);
+                 if prefix_end > 0 {
+                     let prefix = String::from_utf8_lossy(&header.prefix[..prefix_end]);
+                     name = alloc::format!("{}/{}", prefix, name);
+                 }
+            }
 
-            // Parse size (octal)
             let size = parse_octal(&header.size);
-
-            let data_offset = offset + TAR_BLOCK_SIZE;
+            let data_offset = current_offset + 512;
 
             // Only add regular files
             if header.typeflag == b'0' || header.typeflag == 0 {
-                self.files.push(TarFile {
+                files.push(TarFile {
                     name,
                     size,
-                    data_offset,
+                    data_offset: base_offset + data_offset,
                 });
+            } else if header.typeflag == b'1' || header.typeflag == b'2' {
+                // Hard link or Symbolic link
+                let linkname_end = header.linkname.iter().position(|&b| b == 0).unwrap_or(100);
+                let mut linkname = String::from_utf8_lossy(&header.linkname[..linkname_end]).into_owned();
+                
+                // If it's a relative symlink, try to resolve it relative to the current file's directory
+                if header.typeflag == b'2' && !linkname.starts_with('/') {
+                    if let Some(parent) = name.rfind('/') {
+                        let dir = &name[..parent];
+                        linkname = alloc::format!("{}/{}", dir, linkname);
+                    }
+                }
+
+                // Find target info
+                let target_info = files.iter().find(|f| {
+                    let f_norm = f.name.trim_start_matches('/').trim_start_matches("./");
+                    let l_norm = linkname.trim_start_matches('/').trim_start_matches("./");
+                    f_norm == l_norm
+                }).map(|f| (f.size, f.data_offset, f.name.clone()));
+                
+                if let Some((t_size, t_offset, t_name)) = target_info {
+                    crate::kprintln!("TarFs: Resolved link {} -> {}", name, t_name);
+                    files.push(TarFile {
+                        name,
+                        size: t_size,
+                        data_offset: t_offset,
+                    });
+                } else {
+                    // crate::kprintln!("TarFs: Link target not found: {} -> {}", name, linkname);
+                    // For now, don't push if target not found. 
+                    // In a real FS we would store the link and resolve at open.
+                }
             }
 
-            // Move to next header (size rounded up to block boundary)
-            let blocks = (size + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
-            offset = data_offset + blocks * TAR_BLOCK_SIZE;
+            let data_blocks = (size + 511) / 512;
+            current_offset = data_offset + (data_blocks * 512) as u64;
+        }
+
+        Self {
+            device,
+            base_offset,
+            files,
         }
     }
 
     /// Find a file by path
     pub fn find(&self, path: &str) -> Option<&TarFile> {
-        // Normalize path (remove leading /)
         let normalized = path.trim_start_matches('/');
-        self.files.iter().find(|f| {
+        
+        if let Some(f) = self.files.iter().find(|f| {
             let fname = f.name.trim_start_matches('/').trim_start_matches("./");
             fname == normalized
-        })
+        }) {
+            return Some(f);
+        }
+
+        // Suffix heuristic
+        if let Some(filename) = path.split('/').last() {
+             let suffix = alloc::format!("/{}", filename);
+             let candidates = self.files.iter().filter(|f| f.name.ends_with(&suffix) || f.name == filename);
+             for f in candidates {
+                 crate::kprintln!("TarFs: Fuzzy matched '{}' to '{}'", path, f.name);
+                 return Some(f);
+             }
+        }
+        None
     }
 
-    /// Read file data
-    pub fn read(&self, file: &TarFile) -> &[u8] {
-        &self.data[file.data_offset..file.data_offset + file.size]
+    pub fn open(self: &Arc<Self>, path: &str) -> Option<Box<dyn crate::vfs::File>> {
+        let file_info = self.find(path)?.clone();
+        Some(Box::new(TarFileHandle {
+            fs: self.clone(),
+            file_info,
+            pos: 0,
+        }))
     }
 
-    /// List all files
     pub fn list(&self) -> &[TarFile] {
         &self.files
+    }
+}
+
+pub struct TarFileHandle {
+    fs: Arc<TarFs>,
+    file_info: TarFile,
+    pos: u64,
+}
+
+impl crate::vfs::File for TarFileHandle {
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        let remaining = self.file_info.size as u64 - self.pos;
+        let to_read = (buf.len() as u64).min(remaining);
+        
+        if to_read == 0 { return 0; }
+        
+        if self.fs.device.read_at(self.file_info.data_offset + self.pos, &mut buf[..to_read as usize]) {
+            self.pos += to_read;
+            to_read as usize
+        } else {
+            0
+        }
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> usize {
+        let remaining = if offset >= self.file_info.size as u64 { 0 } else { self.file_info.size as u64 - offset };
+        let to_read = (buf.len() as u64).min(remaining);
+        
+        if to_read == 0 { return 0; }
+        
+        if self.fs.device.read_at(self.file_info.data_offset + offset, &mut buf[..to_read as usize]) {
+            to_read as usize
+        } else {
+            0
+        }
+    }
+
+    fn seek(&mut self, pos: u64) {
+        self.pos = pos.min(self.file_info.size as u64);
+    }
+
+    fn size(&self) -> u64 {
+        self.file_info.size as u64
     }
 }
 
