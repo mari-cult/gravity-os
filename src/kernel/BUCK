@@ -1,0 +1,15 @@
+rust_binary(
+    name = "kernel",
+    srcs = glob(["src/**/*.rs", "src/*.s"]),
+    edition = "2024",
+    deps = [
+        "third-party//:goblin",
+        "third-party//:linked_list_allocator",
+        "third-party//:spin",
+    ],
+    target_compatible_with = [
+        "prelude//os/constraints:none",
+        "prelude//cpu/constraints:arm64"
+    ],
+    visibility = ["PUBLIC"],
+)

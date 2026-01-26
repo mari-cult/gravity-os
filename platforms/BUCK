@@ -1,0 +1,29 @@
+# Platforms and Config Settings for GravityOS
+
+# Configuration settings for use in select()
+config_setting(
+    name = "macos-aarch64",
+    constraint_values = [
+        "prelude//cpu/constraints:arm64",
+        "prelude//os/constraints:macos",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+config_setting(
+    name = "arm64-none",
+    constraint_values = [
+        "prelude//cpu/constraints:arm64",
+        "prelude//os/constraints:none",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+platform(
+    name = "kernel-arm64",
+    constraint_values = [
+        "prelude//cpu/constraints:arm64",
+        "prelude//os/constraints:none",
+    ],
+    visibility = ["PUBLIC"],
+)

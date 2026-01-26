@@ -1,0 +1,58 @@
+load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
+load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain")
+load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
+load(":cxx.bzl", "gravity_cxx_toolchain", "gravity_cxx_tools")
+
+system_genrule_toolchain(
+    name = "genrule",
+    visibility = ["PUBLIC"],
+)
+
+system_python_bootstrap_toolchain(
+    name = "python_bootstrap",
+    visibility = ["PUBLIC"],
+)
+
+system_rust_toolchain(
+    name = "rust",
+    visibility = ["PUBLIC"],
+    rustc_target_triple = select({
+        "prelude//cpu/constraints:arm64": select({
+            "prelude//os/constraints:macos": "aarch64-apple-darwin",
+            "prelude//os/constraints:none": "aarch64-apple-darwin",
+        }),
+        "prelude//cpu/constraints:x86_64": "x86_64-unknown-linux-gnu",
+    }),
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Crelocation-model=pic",
+        "-Clink-arg=-fstack-protector",
+        "-Cunsafe-allow-abi-mismatch=sanitizer",
+    ],
+)
+
+gravity_cxx_tools(
+    name = "cxx_tools_macos",
+    visibility = ["PUBLIC"],
+)
+
+gravity_cxx_tools(
+    name = "cxx_tools_none",
+    linker_type = "darwin", # Kernel uses Mach-O
+    visibility = ["PUBLIC"],
+)
+
+gravity_cxx_toolchain(
+    name = "cxx",
+    visibility = ["PUBLIC"],
+    _cxx_tools_info = select({
+        "prelude//os/constraints:none": ":cxx_tools_none",
+        "prelude//os/constraints:macos": ":cxx_tools_macos",
+        "DEFAULT": ":cxx_tools_macos",
+    }),
+    linker_executable = select({
+        "prelude//os/constraints:none": "root//src/tools/linker-wrapper:linker-wrapper",
+        "prelude//os/constraints:macos": None,
+        "DEFAULT": None,
+    }),
+)

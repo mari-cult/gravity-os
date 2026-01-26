@@ -1,0 +1,12 @@
+rust_binary(
+    name = "make-disk",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/main.rs",
+    edition = "2024",
+    deps = [
+        "third-party//:clap",
+        "third-party//:tar",
+        "third-party//:thiserror",
+    ],
+    visibility = ["PUBLIC"],
+)
