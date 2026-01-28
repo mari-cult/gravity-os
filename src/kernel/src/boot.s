@@ -35,6 +35,11 @@ zero_bss:
     cbnz x1, zero_bss
 
 2:
+    /* Enable FPU/SIMD */
+    mov x0, #0x300000               /* CPACR_EL1.FPEN = 0b11 (EL0/EL1 enabled) */
+    msr cpacr_el1, x0
+    isb
+
     /* Jump to Rust code */
     /* Set stack pointer before jump */
     ldr x0, =0x40800000

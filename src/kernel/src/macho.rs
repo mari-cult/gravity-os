@@ -11,17 +11,7 @@ pub struct MachOLoader {
     pub is_64bit: bool,
 }
 
-pub fn setup_stack(sp: u64, exec_path: &str, mh_addr: u64) -> u64 {
-    // Darwin AArch64 stack layout:
-    // [NULL-terminated strings...]
-    // [Alignment]
-    // [apple[N]] ptr to strings (64-bit)
-    // [NULL]
-    // [envp[N]] ptr to strings (NULL for now)
-    // [NULL]
-    // [argv[N]] ptr to strings
-    // [argc]
-
+pub fn setup_stack(sp: u64, exec_path: &str, mh_addr: u64, is_64bit: bool) -> u64 {
     let mut current_sp = sp;
 
     // Copy strings to stack
@@ -42,30 +32,56 @@ pub fn setup_stack(sp: u64, exec_path: &str, mh_addr: u64) -> u64 {
         string_ptrs.push(current_sp);
     }
 
-    // Align SP to 16 bytes
-    current_sp &= !15;
-
-    // Values (64-bit for AArch64)
-    let values = [
-        mh_addr,        // mach_header (at sp)
-        1u64,           // argc (at sp+8)
-        string_ptrs[0], // argv[0]
-        0u64,           // argv[1] (NULL)
-        0u64,           // env[0] (NULL)
-        string_ptrs[0], // apple[0] (exec path)
-        string_ptrs[1], // apple[1] (cache base)
-        string_ptrs[2], // apple[2] (exec path again)
-        0u64,           // apple[3] (NULL)
-    ];
-
-    current_sp -= (values.len() * 8) as u64;
-    let stack_top = current_sp;
-
-    unsafe {
-        core::ptr::copy_nonoverlapping(values.as_ptr(), current_sp as *mut u64, values.len());
+    // Align SP
+    if is_64bit {
+        current_sp &= !15;
+    } else {
+        current_sp &= !3;
     }
 
-    stack_top
+    if is_64bit {
+        // 64-bit values
+        let values = [
+            mh_addr,        // mach_header (at sp)
+            1u64,           // argc (at sp+8)
+            string_ptrs[0], // argv[0]
+            0u64,           // argv[1] (NULL)
+            0u64,           // envp[0] (NULL)
+            string_ptrs[0], // apple[0] (exec path)
+            string_ptrs[1], // apple[1] (cache base)
+            string_ptrs[2], // apple[2] (exec path again)
+            0u64,           // apple[3] (NULL)
+        ];
+
+        current_sp -= (values.len() * 8) as u64;
+        let stack_top = current_sp;
+        unsafe {
+            core::ptr::copy_nonoverlapping(values.as_ptr(), current_sp as *mut u64, values.len());
+        }
+        stack_top
+    } else {
+        // 32-bit values
+        let values = [
+            mh_addr as u32,        // mach_header
+            1u32,                  // argc
+            string_ptrs[0] as u32, // argv[0]
+            0u32,                  // argv[1] (NULL)
+            0u32,                  // envp[0] (NULL)
+            string_ptrs[0] as u32, // apple[0]
+            string_ptrs[1] as u32, // apple[1]
+            string_ptrs[2] as u32, // apple[2]
+            0u32,                  // apple[3] (NULL)
+        ];
+
+        current_sp -= (values.len() * 4) as u64;
+        // Re-align to 16 bytes if required by ABI (Darwin ARMv7 usually 4 or 8, but 16 is safe)
+        current_sp &= !15;
+        let stack_top = current_sp;
+        unsafe {
+            core::ptr::copy_nonoverlapping(values.as_ptr(), current_sp as *mut u32, values.len());
+        }
+        stack_top
+    }
 }
 
 fn segname_to_str(segname: &[u8; 16]) -> &str {
@@ -170,11 +186,7 @@ impl MachOLoader {
             );
 
             let perm = match (prot & 1 != 0, prot & 2 != 0, prot & 4 != 0) {
-                (true, true, true) => crate::mmu::MapPermission::UserRWX,
-                (true, true, false) => crate::mmu::MapPermission::UserRW,
-                (true, false, true) => crate::mmu::MapPermission::UserRX,
-                (true, false, false) => crate::mmu::MapPermission::UserRO,
-                _ => crate::mmu::MapPermission::UserRO,
+                _ => crate::mmu::MapPermission::UserRWX,
             };
 
             // Map the segment as RW first so kernel can copy data into it

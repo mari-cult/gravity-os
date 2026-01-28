@@ -47,8 +47,11 @@ __switch_to:
 kernel_thread_starter:
     msr elr_el1, x19
     msr sp_el0, x20
+    /* AArch32 uses X13 as SP (R13) and X14 as LR (R14) */
+    mov x13, x20
+    mov x14, #0
     
-    /* Set arguments x0..x5 */
+    /* Set arguments x0..x5 from x21..x26 */
     mov x0, x21
     mov x1, x22
     mov x2, x23
@@ -56,7 +59,7 @@ kernel_thread_starter:
     mov x4, x25
     mov x5, x26
 
-    /* Zero out remaining registers */
+    /* Zero out remaining registers up to x12 (R12) and others */
     mov x6, #0
     mov x7, #0
     mov x8, #0
@@ -64,15 +67,15 @@ kernel_thread_starter:
     mov x10, #0
     mov x11, #0
     mov x12, #0
-    mov x13, #0
-    mov x14, #0
     mov x15, #0
     mov x16, #0
     mov x17, #0
     mov x18, #0
     
     /* Set TLS (x28 holds tls_base) */
+    /* AArch32 often uses TPIDRRO_EL0 for TLS (Read-Only Thread ID Register) */
     msr tpidr_el0, x28
+    msr tpidrro_el0, x28
 
     /* SPSR_EL1 from flags (x27) */
     msr spsr_el1, x27

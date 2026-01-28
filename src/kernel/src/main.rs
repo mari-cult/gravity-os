@@ -97,97 +97,13 @@ pub extern "C" fn kmain() {
     let main_bin = {
         let mut file = vfs::open("/sbin/launchd").expect("Failed to open launchd");
         kprintln!("Reading /sbin/launchd ({} bytes)...", file.size());
-        let data = file.read_to_end();
-        if data.len() >= 320 {
-            kprintln!(
-                "launchd header: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                data[0],
-                data[1],
-                data[2],
-                data[3],
-                data[4],
-                data[5],
-                data[6],
-                data[7]
-            );
-            kprintln!("launchd at 256:");
-            for i in 0..4 {
-                let off = 256 + i * 16;
-                kprintln!(
-                    "  {:03x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}  {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                    off,
-                    data[off + 0],
-                    data[off + 1],
-                    data[off + 2],
-                    data[off + 3],
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                    data[off + 8],
-                    data[off + 9],
-                    data[off + 10],
-                    data[off + 11],
-                    data[off + 12],
-                    data[off + 13],
-                    data[off + 14],
-                    data[off + 15]
-                );
-            }
-        }
-        data
+        file.read_to_end()
     };
     kprintln!("Opening /usr/lib/dyld...");
     let dyld_bin = {
         let mut file = vfs::open("/usr/lib/dyld").expect("Failed to open dyld");
         kprintln!("Reading /usr/lib/dyld ({} bytes)...", file.size());
-        let data = file.read_to_end();
-        if data.len() >= 320 {
-            kprintln!(
-                "dyld header: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                data[0],
-                data[1],
-                data[2],
-                data[3],
-                data[4],
-                data[5],
-                data[6],
-                data[7]
-            );
-            kprintln!("dyld at 256:");
-            for i in 0..4 {
-                let off = 256 + i * 16;
-                kprintln!(
-                    "  {:03x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}  {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                    off,
-                    data[off + 0],
-                    data[off + 1],
-                    data[off + 2],
-                    data[off + 3],
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                    data[off + 8],
-                    data[off + 9],
-                    data[off + 10],
-                    data[off + 11],
-                    data[off + 12],
-                    data[off + 13],
-                    data[off + 14],
-                    data[off + 15]
-                );
-            }
-        } else if data.len() > 0 {
-            kprintln!(
-                "dyld raw header: {:02x} {:02x} {:02x} {:02x}",
-                data[0],
-                data[1],
-                data[2],
-                data[3]
-            );
-        }
-        data
+        file.read_to_end()
     };
     kprintln!("Parsing Mach-O binaries...");
     let main_loader = macho::MachOLoader::load(&main_bin, load_offset);
@@ -221,7 +137,8 @@ pub extern "C" fn kmain() {
         // Setup BSD/Mach stack layout
         kprintln!("Initial User SP: {:x}", user_sp_initial);
         // Pass the actual address where the Mach-O header was loaded (mapped)
-        let new_sp = macho::setup_stack(user_sp_initial, &path, loader.header_addr);
+        let new_sp =
+            macho::setup_stack(user_sp_initial, &path, loader.header_addr, loader_is_64bit);
         kprintln!("Stack setup complete. New User SP: {:x}", new_sp);
 
         // Initial User SP: new_sp points to mh_addr.

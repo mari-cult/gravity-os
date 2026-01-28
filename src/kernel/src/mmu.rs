@@ -91,11 +91,18 @@ pub fn init() {
         asm!("mrs {}, sctlr_el1", out(reg) sctlr);
 
         // SCTLR_EL1 RES1 bits
+
         sctlr |= (1 << 29) | (1 << 28) | (1 << 22) | (1 << 20) | (1 << 11);
-        // Clear conflicting bits
-        sctlr &= !(1 << 1); // No Alignment check
-        sctlr &= !(1 << 3); // No Stack alignment check
-        sctlr |= 1; // M bit
+
+        // SCTLR_EL1.M = 1 (Enable MMU)
+
+        sctlr |= 1;
+
+        // SCTLR_EL1.I = 0 (Disable I-cache for now)
+
+        // SCTLR_EL1.C = 0 (Disable D-cache for now)
+
+        sctlr &= !((1 << 12) | (1 << 2));
 
         asm!("msr sctlr_el1, {}", in(reg) sctlr);
         asm!("isb");
@@ -127,16 +134,16 @@ pub fn init() {
     );
 
     // Map CommPage at 0xFFFF0000
-    // CommPage needs to be UserRO
+    // CommPage needs to be UserRO. Map 16KB (4 pages).
     map_range(
         0xFFFF0000,
         core::ptr::addr_of!(COMMPAGE_STORAGE) as u64,
-        4096,
+        16384,
         MapPermission::UserRO,
     );
 }
 
-pub static mut COMMPAGE_STORAGE: [u8; 4096] = [0; 4096];
+pub static mut COMMPAGE_STORAGE: [u8; 65536] = [0; 65536];
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum MapPermission {
@@ -163,11 +170,10 @@ fn get_ap_bits(perm: MapPermission) -> u64 {
 
 fn get_xn_bits(perm: MapPermission) -> u64 {
     match perm {
-        MapPermission::UserRX => PXN, // UserRX means EL1 cannot exec, EL0 can.
-        MapPermission::UserRWX => PXN,
+        MapPermission::UserRX | MapPermission::UserRWX => 0, // Both EL0 and EL1 can execute (PXN=0, UXN=0)
         MapPermission::UserRO | MapPermission::UserRW => UXN | PXN,
         MapPermission::KernelRWDevice => UXN | PXN,
-        _ => UXN, // Kernel default
+        MapPermission::KernelRO | MapPermission::KernelRW => UXN, // Kernel non-exec
     }
 }
 

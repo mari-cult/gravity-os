@@ -739,45 +739,42 @@ impl<F: Read + Seek> Fork<F> {
             window_bits: 15, // zlib header
         };
 
-        let ret = init(&mut strm, config);
-        if ret != ReturnCode::Ok {
-            return Err(Error::InvalidData(format!("inflateInit failed: {:?}", ret)));
+        if init(&mut strm, config) != ReturnCode::Ok {
+            return Err(Error::InvalidData(String::from("inflateInit failed")));
         }
 
-        // Use a reasonable initial buffer if size is unknown or suspicious
-        let mut decompressed = if uncompressed_size > 0 && uncompressed_size < 128 * 1024 * 1024 {
-            vec![0u8; uncompressed_size]
-        } else {
-            vec![0u8; 65536]
-        };
-
-        strm.next_out = decompressed.as_mut_ptr();
-        strm.avail_out = decompressed.len() as _;
-
+        let mut decompressed = vec![
+            0u8;
+            if uncompressed_size > 0 && uncompressed_size < 128 * 1024 * 1024 {
+                uncompressed_size
+            } else {
+                65536
+            }
+        ];
         let strm_infl = unsafe { InflateStream::from_stream_mut(&mut strm).unwrap() };
-        let mut accumulated_out = 0usize;
+
+        let mut total_out = 0usize;
+        let mut stream_offset = 0usize;
 
         loop {
+            strm.next_out = unsafe { decompressed.as_mut_ptr().add(total_out) };
+            strm.avail_out = (decompressed.len() - total_out) as _;
+
             let ret = unsafe { inflate(strm_infl, zlib_rs::InflateFlush::Finish) };
 
-            accumulated_out += strm.total_out as usize;
+            let produced_in_session = strm.total_out as usize;
+            total_out = stream_offset + produced_in_session;
 
             if ret == ReturnCode::StreamEnd {
                 if strm.avail_in > 0 {
-                    // Check if next byte looks like another zlib stream (magic 0x78)
-                    let next_byte = unsafe { *strm.next_in };
-                    if next_byte == 0x78 {
-                        if strm.avail_out == 0 {
-                            let old_len = decompressed.len();
-                            decompressed.resize(old_len + 65536, 0);
-                            strm.next_out =
-                                unsafe { decompressed.as_mut_ptr().add(accumulated_out) };
-                            strm.avail_out = (decompressed.len() - accumulated_out) as _;
-                        }
+                    // Check magic 0x78
+                    if unsafe { *strm.next_in } == 0x78 {
+                        stream_offset = total_out;
                         unsafe { reset(strm_infl) };
-                        // After reset, we must restore the output pointers to the remaining space
-                        strm.next_out = unsafe { decompressed.as_mut_ptr().add(accumulated_out) };
-                        strm.avail_out = (decompressed.len() - accumulated_out) as _;
+                        // Ensure we have space for next stream
+                        if total_out == decompressed.len() {
+                            decompressed.resize(total_out + 65536, 0);
+                        }
                         continue;
                     }
                 }
@@ -790,28 +787,26 @@ impl<F: Read + Seek> Fork<F> {
                     if old_len >= 128 * 1024 * 1024 {
                         unsafe { end(strm_infl) };
                         return Err(Error::InvalidData(String::from(
-                            "Decompressed data exceeds 128MB limit",
+                            "Decompressed data too large",
                         )));
                     }
                     let grow_by = core::cmp::max(65536, old_len);
                     decompressed.resize(old_len + grow_by, 0);
-                    strm.next_out = unsafe { decompressed.as_mut_ptr().add(accumulated_out) };
-                    strm.avail_out = (decompressed.len() - accumulated_out) as _;
                     continue;
                 }
-                // If we got Ok but didn't finish and have space, something is wrong
+
+                if strm.avail_in > 0 {
+                    continue;
+                }
+
                 break;
             }
 
             unsafe { end(strm_infl) };
-            return Err(Error::InvalidData(format!(
-                "Decompression failed: {:?}",
-                ret
-            )));
+            return Err(Error::InvalidData(format!("inflate failed {:?}", ret)));
         }
 
-        decompressed.truncate(accumulated_out);
-
+        decompressed.truncate(total_out);
         unsafe { end(strm_infl) };
         Ok(decompressed)
     }

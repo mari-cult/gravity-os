@@ -67,12 +67,15 @@ impl Process {
         // Pass up to 6 args in x21..x26
         context.regs[2..(args.len().min(6) + 2)].copy_from_slice(&args[..args.len().min(6)]);
 
-        // SPSR: Mask all DAIF bits (0x3c0)
-        // If 64-bit: EL0t (0x000)
-        // If 32-bit: User mode (0x010)
-        let mut spsr = 0x3c0u64;
+        // SPSR:
+        // AArch64: [9]D [8]A [7]I [6]F (mask bits)
+        // AArch32: [9]E (Endianness: 0=LE, 1=BE) [8]A [7]I [6]F (mask bits)
+        // We want DAIF masked (bits 9,8,7,6 in AArch64)
+        // For AArch32, we want A, I, F masked (bits 8,7,6) and E=0 (Little Endian, bit 9).
+        let mut spsr = 0x3c0u64; // Sets bits 9,8,7,6
         if !is_64bit {
-            spsr |= 0x10;
+            spsr &= !(1 << 9); // Clear E bit for AArch32 Little Endian
+            spsr |= 0x10; // User mode
         }
         context.regs[8] = spsr; // x27
 
@@ -134,6 +137,14 @@ impl Scheduler {
             // No ready process. Keep running current.
             None
         }
+    }
+
+    pub fn current_pid(&self) -> u64 {
+        self.current_process.as_ref().map(|p| p.pid).unwrap_or(0)
+    }
+
+    pub fn current_ipc_space(&mut self) -> Option<&mut IpcSpace> {
+        self.current_process.as_mut().map(|p| &mut p.ipc_space)
     }
 }
 

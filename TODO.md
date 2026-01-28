@@ -1,6 +1,7 @@
 # To Do
 
 - [x] VirtIO Block Driver
+- [x] HFS+ driver
 - [ ] Mach IPC
 - [ ] Dyld in Rust with demo program
 - Implement missing syscalls
