@@ -37,7 +37,7 @@ fn main() {
         final_args.push("13.0.0".to_string());
 
         let mut skip_next = false;
-        for (i, arg) in args.iter().enumerate() {
+        for arg in args.iter() {
             if skip_next {
                 skip_next = false;
                 continue;

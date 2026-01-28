@@ -24,7 +24,7 @@ pub fn fast_unicode_compare(str1: &[u16], str2: &[u16]) -> Ordering {
         c1 = 0;
         c2 = 0;
         //  Find next non-ignorable char from str1, or zero if no more
-        while let Some(next_char) = str1_iter.next() {
+        for next_char in str1_iter.by_ref() {
             c1 = *next_char;
             let temp = LOWER_CASE_TABLE[c1 as usize >> 8];
             if temp != 0 {
@@ -37,7 +37,7 @@ pub fn fast_unicode_compare(str1: &[u16], str2: &[u16]) -> Ordering {
             }
         }
         //  Find next non-ignorable char from str2, or zero if no more
-        while let Some(next_char) = str2_iter.next() {
+        for next_char in str2_iter.by_ref() {
             c2 = *next_char;
             let temp = LOWER_CASE_TABLE[c2 as usize >> 8];
             if temp != 0 {
@@ -58,11 +58,7 @@ pub fn fast_unicode_compare(str1: &[u16], str2: &[u16]) -> Ordering {
             return Equal; //  yes, so strings are equal
         }
     }
-    if c1 < c2 {
-        return Less;
-    } else {
-        return Greater;
-    }
+    if c1 < c2 { Less } else { Greater }
 }
 
 /*  The lower case table consists of a 256-entry high-byte table followed by

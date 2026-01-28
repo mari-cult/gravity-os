@@ -15,9 +15,9 @@ use core::fmt;
 use core::marker::PhantomData;
 use spin::Mutex;
 use unicode_normalization::UnicodeNormalization;
+use zlib_rs::ReturnCode;
 use zlib_rs::c_api::z_stream;
 use zlib_rs::inflate::{InflateConfig, InflateStream, end, inflate, init, reset};
-use zlib_rs::{ReturnCode, Status};
 
 mod hfs_strings;
 pub mod internal;
@@ -362,7 +362,7 @@ impl<K: Key, R: Record<K>> Node<K, R> {
     fn load(data: &[u8]) -> Result<Node<K, R>> {
         let mut cursor = Cursor::new(data);
         let node = BTNodeDescriptor::import(&mut cursor)?;
-        let num_offsets = (node.numRecords + 1) as usize;
+        let num_offsets = (node.num_records + 1) as usize;
         let last_offset_pos = data.len() - num_offsets * 2;
         let mut offsets = Vec::with_capacity(num_offsets);
 
@@ -384,43 +384,44 @@ impl<K: Key, R: Record<K>> Node<K, R> {
             records.push(&data[first..last]);
         }
 
-        if node.kind == kBTHeaderNode {
-            let mut r0_cursor = Cursor::new(records[0]);
-            Ok(Node::HeaderNode(HeaderNode {
-                descriptor: node,
-                header: BTHeaderRec::import(&mut r0_cursor)?,
-                user_data: records[1].to_vec(),
-                map: records[2].to_vec(),
-            }))
-        } else if node.kind == kBTMapNode {
-            Ok(Node::MapNode(MapNode { _descriptor: node }))
-        } else if node.kind == kBTIndexNode {
-            let mut r = Vec::<IndexRecord<K>>::new();
-            for record in &records {
-                let mut v = Cursor::new(record);
-                let r2 = K::import(&mut v)?;
-                r.push(IndexRecord {
-                    key: r2,
-                    node_id: v.read_u32_be()?,
-                });
+        match node.kind {
+            BTNodeKind::HeaderNode => {
+                let mut r0_cursor = Cursor::new(records[0]);
+                Ok(Node::HeaderNode(HeaderNode {
+                    descriptor: node,
+                    header: BTHeaderRec::import(&mut r0_cursor)?,
+                    user_data: records[1].to_vec(),
+                    map: records[2].to_vec(),
+                }))
             }
-            Ok(Node::IndexNode(IndexNode {
-                descriptor: node,
-                records: r,
-            }))
-        } else if node.kind == kBTLeafNode {
-            let mut r = Vec::<Arc<R>>::new();
-            for record in &records {
-                let mut v = Cursor::new(record);
-                let r2 = K::import(&mut v)?;
-                r.push(Arc::new(R::import(&mut v, r2)?));
+            BTNodeKind::MapNode => Ok(Node::MapNode(MapNode { _descriptor: node })),
+            BTNodeKind::IndexNode => {
+                let mut r = Vec::<IndexRecord<K>>::new();
+                for record in &records {
+                    let mut v = Cursor::new(record);
+                    let r2 = K::import(&mut v)?;
+                    r.push(IndexRecord {
+                        key: r2,
+                        node_id: v.read_u32_be()?,
+                    });
+                }
+                Ok(Node::IndexNode(IndexNode {
+                    descriptor: node,
+                    records: r,
+                }))
             }
-            Ok(Node::LeafNode(LeafNode {
-                descriptor: node,
-                records: r,
-            }))
-        } else {
-            Err(Error::InvalidData(String::from("Invalid Node Type")))
+            BTNodeKind::LeafNode => {
+                let mut r = Vec::<Arc<R>>::new();
+                for record in &records {
+                    let mut v = Cursor::new(record);
+                    let r2 = K::import(&mut v)?;
+                    r.push(Arc::new(R::import(&mut v, r2)?));
+                }
+                Ok(Node::LeafNode(LeafNode {
+                    descriptor: node,
+                    records: r,
+                }))
+            }
         }
     }
 }
@@ -468,7 +469,7 @@ impl<F: Read + Seek, K: Key, R: Record<K>> BTree<F, K, R> {
     }
 
     pub fn get_record(&mut self, key: &K) -> Result<Arc<R>> {
-        self.get_record_node(key, self.header.header.rootNode as usize)
+        self.get_record_node(key, self.header.header.root_node as usize)
     }
 
     fn get_record_node(&mut self, key: &K, node_id: usize) -> Result<Arc<R>> {
@@ -496,10 +497,10 @@ impl<F: Read + Seek, K: Key, R: Record<K>> BTree<F, K, R> {
                         return Ok(Arc::clone(record));
                     }
                 }
-                if x.descriptor.fLink == 0 {
+                if x.descriptor.f_link == 0 {
                     return Err(Error::KeyNotFound);
                 }
-                let next_node = self.get_node(x.descriptor.fLink as usize)?;
+                let next_node = self.get_node(x.descriptor.f_link as usize)?;
                 x = match next_node {
                     Node::LeafNode(x) => x,
                     _ => return Err(Error::BadNode),
@@ -510,7 +511,7 @@ impl<F: Read + Seek, K: Key, R: Record<K>> BTree<F, K, R> {
     }
 
     pub fn get_record_range(&mut self, first: &K, last: &K) -> Result<Vec<Arc<R>>> {
-        self.get_record_range_node(first, last, self.header.header.rootNode as usize)
+        self.get_record_range_node(first, last, self.header.header.root_node as usize)
     }
 
     fn get_record_range_node(
@@ -546,11 +547,11 @@ impl<F: Read + Seek, K: Key, R: Record<K>> BTree<F, K, R> {
                     }
                     if x.records.is_empty()
                         || x.records[x.records.len() - 1].get_key() >= last
-                        || x.descriptor.fLink == 0
+                        || x.descriptor.f_link == 0
                     {
                         break;
                     }
-                    let next_node = self.get_node(x.descriptor.fLink as usize)?;
+                    let next_node = self.get_node(x.descriptor.f_link as usize)?;
                     x = match next_node {
                         Node::LeafNode(x) => x,
                         _ => return Err(Error::InvalidRecordType),
@@ -653,7 +654,7 @@ impl<F: Read + Seek> Fork<F> {
 
         data: &HFSPlusForkData,
     ) -> Result<Fork<F>> {
-        let block_size = volume.header.blockSize as u64;
+        let block_size = volume.header.block_size as u64;
 
         let mut extents = Vec::with_capacity(8);
 
@@ -665,33 +666,33 @@ impl<F: Read + Seek> Fork<F> {
 
         while let Some(extent_list) = extents_result {
             for extent in &extent_list {
-                if extent.blockCount == 0 {
+                if extent.block_count == 0 {
                     continue;
                 }
 
-                let extent_size = extent.blockCount as u64 * block_size;
+                let extent_size = extent.block_count as u64 * block_size;
 
                 let extent_end = extent_position + extent_size;
 
-                let extent_position_clamped = core::cmp::min(data.logicalSize, extent_position);
+                let extent_position_clamped = core::cmp::min(data.logical_size, extent_position);
 
-                let extent_end_clamped = core::cmp::min(data.logicalSize, extent_end);
+                let extent_end_clamped = core::cmp::min(data.logical_size, extent_end);
 
                 extents.push((
-                    extent.startBlock,
-                    extent.blockCount,
+                    extent.start_block,
+                    extent.block_count,
                     extent_position_clamped,
                     extent_end_clamped,
                 ));
 
                 extent_position += extent_size;
 
-                extent_block += extent.blockCount;
+                extent_block += extent.block_count;
             }
 
             extents_result = None;
 
-            if extent_position < data.logicalSize {
+            if extent_position < data.logical_size {
                 if let Some(et) = &volume.extents_btree {
                     let search_key = ExtentKey::new(catalog_id, fork_type, extent_block);
 
@@ -715,7 +716,7 @@ impl<F: Read + Seek> Fork<F> {
 
             block_size,
 
-            logical_size: data.logicalSize,
+            logical_size: data.logical_size,
 
             extents,
 
@@ -770,7 +771,7 @@ impl<F: Read + Seek> Fork<F> {
                     // Check magic 0x78
                     if unsafe { *strm.next_in } == 0x78 {
                         stream_offset = total_out;
-                        unsafe { reset(strm_infl) };
+                        reset(strm_infl);
                         // Ensure we have space for next stream
                         if total_out == decompressed.len() {
                             decompressed.resize(total_out + 65536, 0);
@@ -785,7 +786,7 @@ impl<F: Read + Seek> Fork<F> {
                 if strm.avail_out == 0 {
                     let old_len = decompressed.len();
                     if old_len >= 512 * 1024 * 1024 {
-                        unsafe { end(strm_infl) };
+                        end(strm_infl);
                         return Err(Error::InvalidData(String::from(
                             "Decompressed data too large",
                         )));
@@ -802,12 +803,12 @@ impl<F: Read + Seek> Fork<F> {
                 break;
             }
 
-            unsafe { end(strm_infl) };
+            end(strm_infl);
             return Err(Error::InvalidData(format!("inflate failed {:?}", ret)));
         }
 
         decompressed.truncate(total_out);
-        unsafe { end(strm_infl) };
+        end(strm_infl);
         Ok(decompressed)
     }
 
@@ -1009,7 +1010,7 @@ impl<F: Read + Seek> Fork<F> {
                         (
                             raw_type,
                             raw_uncompressed_size,
-                            if raw_header_size >= 4 && raw_header_size <= 256 {
+                            if (4..=256).contains(&raw_header_size) {
                                 raw_header_size
                             } else {
                                 4
@@ -1046,14 +1047,15 @@ impl<F: Read + Seek> Fork<F> {
                         // Fallback: Check if the resource data ITSELF is a Zlib stream (some files lack headers)
                         self.position = (data_offset + 4) as u64;
                         let compressed = self.read_to_end()?;
-                        if compressed.len() > 0 && compressed[0] == 0x78 {
-                            if let Ok(decompressed) = self.decompress_zlib(&compressed, 0) {
-                                self.decompressed_cache = Some(Arc::new(decompressed));
-                                self.logical_size =
-                                    self.decompressed_cache.as_ref().unwrap().len() as u64;
-                                self.position = 0;
-                                return Ok(());
-                            }
+                        if !compressed.is_empty()
+                            && compressed[0] == 0x78
+                            && let Ok(decompressed) = self.decompress_zlib(&compressed, 0)
+                        {
+                            self.decompressed_cache = Some(Arc::new(decompressed));
+                            self.logical_size =
+                                self.decompressed_cache.as_ref().unwrap().len() as u64;
+                            self.position = 0;
+                            return Ok(());
                         }
                     }
                 }
@@ -1077,11 +1079,7 @@ impl<F: Read + Seek> Fork<F> {
             }
 
             let current_offset = offset + bytes_read as u64;
-            let extent_offset = if current_offset > extent_begin {
-                current_offset - extent_begin
-            } else {
-                0
-            };
+            let extent_offset = current_offset.saturating_sub(extent_begin);
 
             file.seek(SeekFrom::Start(
                 start_block as u64 * block_size + extent_offset,
@@ -1215,21 +1213,27 @@ impl<F: Read + Seek> HFSVolume<F> {
             extents_btree: None,
         }));
 
-        let catalog_data = volume.lock().header.catalogFile;
+        let catalog_data = volume.lock().header.catalog_file;
 
         let file_clone = Arc::clone(&volume.lock().file);
 
         let catalog_fork = {
             let vol_guard = volume.lock();
 
-            Fork::load(file_clone, kHFSCatalogFileID, 0, &*vol_guard, &catalog_data)?
+            Fork::load(
+                file_clone,
+                K_HFSCATALOG_FILE_ID,
+                0,
+                &*vol_guard,
+                &catalog_data,
+            )?
         };
 
         let temp_btree = BTree::<Fork<F>, CatalogKey<HFSString>, CatalogRecord<HFSString>>::open(
             catalog_fork.clone(),
         )?;
 
-        let compare_type = temp_btree.header.header.keyCompareType;
+        let compare_type = temp_btree.header.header.key_compare_type;
 
         let catalog_enum = if compare_type == 0xBC {
             let btree = BTree::<
@@ -1245,7 +1249,7 @@ impl<F: Read + Seek> HFSVolume<F> {
 
         volume.lock().catalog_btree = Some(catalog_enum);
 
-        let extents_data = volume.lock().header.extentsFile;
+        let extents_data = volume.lock().header.extents_file;
 
         let file_clone_ext = Arc::clone(&volume.lock().file);
 
@@ -1254,7 +1258,7 @@ impl<F: Read + Seek> HFSVolume<F> {
 
             Fork::load(
                 file_clone_ext,
-                kHFSExtentsFileID,
+                K_HFSEXTENTS_FILE_ID,
                 0,
                 &*vol_guard,
                 &extents_data,
@@ -1338,7 +1342,7 @@ impl<F: Read + Seek> HFSVolume<F> {
 
             match &record.body {
                 CatalogBody::Folder(f) => {
-                    current_folder_id = f.folderID;
+                    current_folder_id = f.folder_id;
                 }
 
                 CatalogBody::File(_) => {
@@ -1358,7 +1362,7 @@ impl<F: Read + Seek> HFSVolume<F> {
         let record = self.get_path_record(path)?;
 
         let folder_id = match record.body {
-            CatalogBody::Folder(f) => f.folderID,
+            CatalogBody::Folder(f) => f.folder_id,
 
             _ => return Err(Error::InvalidRecordType),
         };

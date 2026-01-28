@@ -1,2 +1,0 @@
-buildscript.run = true
-extra_deps = ["third-party//:libc", "third-party//:libc_errno"]

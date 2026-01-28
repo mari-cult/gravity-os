@@ -3,12 +3,16 @@ name = "vfdecrypt"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+path = "lib.rs"
+
 [dependencies]
-thiserror = "2.0.18"
-aes = "0.8.4"
-hmac = "0.12.1"
-sha1 = "0.10.6"
-pbkdf2 = "0.12.2"
-des = "0.8.1"
-cbc = { version = "0.1.2", features = ["alloc"] }
-cipher = { version = "0.4.4", features = ["block-padding"] }
+thiserror = { workspace = true }
+aes = { workspace = true }
+hmac = { workspace = true }
+sha1 = { workspace = true }
+pbkdf2 = { workspace = true }
+des = { workspace = true }
+cbc = { workspace = true, features = ["alloc"] }
+cipher = { workspace = true, features = ["block-padding"] }
+rayon = { workspace = true }

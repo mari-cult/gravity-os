@@ -1,0 +1,21 @@
+[package]
+name = "apple-dmg"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+hfsplus = { path = "../hfsplus" }
+anyhow = { workspace = true }
+byteorder = { workspace = true }
+crc32fast = { workspace = true }
+fatfs = { workspace = true }
+flate2 = { workspace = true }
+fscommon = { workspace = true }
+getrandom = { workspace = true }
+md5 = { workspace = true }
+plist = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }

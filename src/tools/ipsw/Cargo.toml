@@ -13,8 +13,8 @@ plist = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-vfdecrypt = { path = "../../libs/vfdecrypt" }
-ipsw-downloader = { path = "../../libs/ipsw-downloader" }
+vfdecrypt = { path = "../../lib/vfdecrypt" }
+ipsw-downloader = { path = "../../lib/ipsw-downloader" }
 indicatif = { workspace = true }
 clap = { workspace = true }
 

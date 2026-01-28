@@ -1,3 +1,3 @@
-# Zed OS
+# Gravity OS
 
-An operating system built with the Zed Editor.
+An operating system built with Gemini.

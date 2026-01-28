@@ -1,7 +1,6 @@
 use crate::kprintln;
 use alloc::string::String;
 use alloc::vec;
-use alloc::vec::Vec;
 use goblin::mach::{Mach, MachO};
 
 pub struct MachOLoader {

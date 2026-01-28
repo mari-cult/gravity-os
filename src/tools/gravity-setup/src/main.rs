@@ -164,12 +164,10 @@ async fn main() -> Result<(), SetupError> {
 
         for i in 0..archive.len() {
             let file = archive.by_index(i)?;
-            if file.name().ends_with(".dmg") {
-                if file.size() > largest_size {
-                    largest_size = file.size();
-                    largest_name = file.name().to_string();
-                    largest_index = i;
-                }
+            if file.name().ends_with(".dmg") && file.size() > largest_size {
+                largest_size = file.size();
+                largest_name = file.name().to_string();
+                largest_index = i;
             }
         }
 
@@ -231,7 +229,7 @@ async fn main() -> Result<(), SetupError> {
     let read_file = File::open(&args.output)?;
     let offset_reader = OffsetFile {
         file: read_file,
-        offset: (args.rootfs_offset_mb * 1024 * 1024) as u64,
+        offset: (args.rootfs_offset_mb * 1024 * 1024),
     };
     println!("Loading HFS+ volume...");
     let volume = HFSVolume::load(offset_reader).map_err(|e| SetupError::Hfs(format!("{:?}", e)))?;
@@ -248,20 +246,20 @@ async fn main() -> Result<(), SetupError> {
                 if let hfsplus::CatalogBody::File(f) = rec.body {
                     println!(
                         "Found {}: size={}, res_size={}",
-                        path, f.dataFork.logicalSize, f.resourceFork.logicalSize
+                        path, f.data_fork.logical_size, f.resource_fork.logical_size
                     );
-                    if f.dataFork.logicalSize == 0 && f.resourceFork.logicalSize > 0 {
+                    if f.data_fork.logical_size == 0 && f.resource_fork.logical_size > 0 {
                         // Scan resource fork for Mach-O magic
                         let file_clone = vol_lock.file.clone();
                         let mut fork = hfsplus::Fork::load(
                             file_clone,
-                            f.fileID,
+                            f.file_id,
                             0xFF,
                             &*vol_lock,
-                            &f.resourceFork,
+                            &f.resource_fork,
                         )
                         .unwrap();
-                        let mut data = vec![0u8; f.resourceFork.logicalSize as usize];
+                        let mut data = vec![0u8; f.resource_fork.logical_size as usize];
                         let mut total_read = 0;
                         while total_read < data.len() {
                             let n =
@@ -272,7 +270,7 @@ async fn main() -> Result<(), SetupError> {
                             total_read += n;
                         }
                         println!("  - Resource fork first 64 bytes:");
-                        for i in 0..min(64, total_read) {
+                        for (i, _) in data.iter().enumerate().take(min(64, total_read)) {
                             print!("{:02x} ", data[i]);
                             if (i + 1) % 16 == 0 {
                                 println!();
@@ -347,7 +345,6 @@ fn create_disk_image(rootfs_dmg: &Path, args: &Args, mp: &MultiProgress) -> Resu
     let mut dmg = DmgReader::open(rootfs_dmg).map_err(|e| SetupError::Dmg(e.to_string()))?;
 
     // Find HFS+ partition
-    let mut hfs_partition_index = None;
     let mut hfs_table = None;
     for i in 0..dmg.plist().partitions().len() {
         let table = dmg
@@ -366,15 +363,12 @@ fn create_disk_image(rootfs_dmg: &Path, args: &Args, mp: &MultiProgress) -> Resu
             if header.len() >= 1026
                 && (&header[1024..1026] == b"H+" || &header[1024..1026] == b"HX")
             {
-                hfs_partition_index = Some(i);
                 hfs_table = Some(table);
                 break;
             }
         }
     }
 
-    let hfs_partition_index = hfs_partition_index
-        .ok_or_else(|| SetupError::Hfs("No HFS+ partition found".to_string()))?;
     let hfs_table = hfs_table.unwrap();
 
     let output_file = std::fs::OpenOptions::new()

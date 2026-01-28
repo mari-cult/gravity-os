@@ -1,10 +1,10 @@
 # CLAUDE.md
 
-This file provides guidance for interacting with the Zed OS codebase.
+This file provides guidance for interacting with the GravityOS codebase.
 
 ## Project Overview
 
-Zed OS is an operating system built with the Zed Editor. It is a Rust-based kernel targeting ARM64 (aarch64-unknown-none-softfloat). It aims to run ios 5 ARMv7 userspace binaries.
+GravityOS is a Rust-based operating system and kernel targeting ARM64 (aarch64-unknown-none-softfloat). It aims to run ios 5 ARMv7 userspace binaries.
 
 ## Build and Test
 

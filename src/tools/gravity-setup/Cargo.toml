@@ -1,0 +1,22 @@
+[package]
+name = "gravity-setup"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+apple-dmg = { path = "../../lib/apple-dmg" }
+hfsplus = { path = "../../lib/hfsplus" }
+vfdecrypt = { path = "../../lib/vfdecrypt" }
+ipsw-downloader = { path = "../../lib/ipsw-downloader" }
+reqwest = { workspace = true }
+plist = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+futures-util = { workspace = true }
+indicatif = { workspace = true }
+zip = { workspace = true }
+clap = { workspace = true }
+rayon = { workspace = true }
+flate2 = { workspace = true }
+memmap2 = { workspace = true }

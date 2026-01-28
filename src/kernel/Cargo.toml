@@ -1,10 +1,16 @@
 [package]
-name = "zedos-kernel"
+name = "kernel"
 version = "0.1.0"
 edition = "2024"
+
+[[bin]]
+name = "zedos-kernel"
+path = "src/main.rs"
 
 [dependencies]
 goblin = { workspace = true }
 linked_list_allocator = { workspace = true }
 spin = { workspace = true }
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }
 hfsplus = { path = "../lib/hfsplus" }

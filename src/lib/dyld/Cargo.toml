@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 goblin = { workspace = true }
 spin = { workspace = true }
-bitflags = "2.6.0"
+bitflags = "2.10.0"
 linked_list_allocator = { workspace = true }
 
 [features]

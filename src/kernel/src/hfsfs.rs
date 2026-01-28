@@ -131,10 +131,10 @@ impl HfsFs {
         }));
 
         kprintln!("HFS+: Loading catalog fork...");
-        let catalog_data = volume.lock().header.catalogFile;
+        let catalog_data = volume.lock().header.catalog_file;
         let catalog_fork = Fork::load(
             Arc::clone(&file_arc),
-            hfsplus::kHFSCatalogFileID,
+            hfsplus::K_HFSCATALOG_FILE_ID,
             0,
             &*volume.lock(),
             &catalog_data,
@@ -142,10 +142,10 @@ impl HfsFs {
         .unwrap();
 
         kprintln!("HFS+: Loading extents fork...");
-        let extents_data = volume.lock().header.extentsFile;
+        let extents_data = volume.lock().header.extents_file;
         let extents_fork = Fork::load(
             Arc::clone(&file_arc),
-            hfsplus::kHFSExtentsFileID,
+            hfsplus::K_HFSEXTENTS_FILE_ID,
             0,
             &*volume.lock(),
             &extents_data,
@@ -157,7 +157,7 @@ impl HfsFs {
             catalog_fork.clone(),
         )
         .unwrap();
-        let compare_type = temp_btree.header.header.keyCompareType;
+        let compare_type = temp_btree.header.header.key_compare_type;
         let catalog_enum = if compare_type == 0xBC {
             let btree = hfsplus::BTree::<
                 _,
@@ -184,17 +184,17 @@ impl HfsFs {
         let vol = self.volume.lock();
         let record = vol.get_path_record(path).ok()?;
         if let CatalogBody::File(file_info) = record.body {
-            let mut fork_data = &file_info.dataFork;
+            let mut fork_data = &file_info.data_fork;
             let mut fork_type = 0;
-            if fork_data.logicalSize == 0 && file_info.resourceFork.logicalSize > 0 {
-                fork_data = &file_info.resourceFork;
+            if fork_data.logical_size == 0 && file_info.resource_fork.logical_size > 0 {
+                fork_data = &file_info.resource_fork;
                 fork_type = 0xFF; // Usually resource fork is different type in extents btree, but Fork::load handles it?
                 // Actually, Fork::load takes fork_type. Catalog data fork is 0, resource is 0xFF.
             }
 
             let fork = Fork::load(
                 Arc::clone(&vol.file),
-                file_info.fileID,
+                file_info.file_id,
                 fork_type,
                 &*vol,
                 fork_data,

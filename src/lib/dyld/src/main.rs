@@ -70,7 +70,7 @@ pub unsafe extern "C" fn dyld_start(
     }
 
     // Find shared cache
-    let mut sc_base = 0x30000000usize;
+    let sc_base = 0x30000000usize;
     // TODO: Parse apple_ptr to find dyld_shared_cache_base_address
 
     let cache = SharedCache::from_addr(sc_base).expect("Failed to find shared cache");
