@@ -133,30 +133,70 @@ fn dump_mem(addr: u64, len: u64) {
 
 fn handle_a32_syscall(frame: &mut TrapFrame) {
     let r12 = frame.x[12] as i32;
+
     let r7 = frame.x[7] as i32;
 
-    kprintln!(
-        "A32 Syscall: R12={} R7={} R0={:x} PC={:x}",
-        r12,
-        r7,
-        frame.x[0],
-        frame.elr
-    );
+    let syscall_num = if r12 != 0 { r12 } else { r7 };
 
-    if r12 < 0 || r12 == -2147483648 {
+    if syscall_num != 4 {
+        // Don't spam write
+
+        kprintln!(
+            "A32 Syscall: num={} R0={:x} R1={:x} R2={:x} R3={:x} PC={:x}",
+            syscall_num,
+            frame.x[0],
+            frame.x[1],
+            frame.x[2],
+            frame.x[3],
+            frame.elr
+        );
+    }
+
+    if syscall_num < 0 || syscall_num as u32 == 0x80000000 {
         // Mach trap
-        match r12 {
+
+        match syscall_num {
             -26 => {
-                // mach_msg_trap(msg, option, send_size, rcv_size, rcv_name, timeout, notify)
-                let msg = frame.x[0] as *mut crate::ipc::MachMsgHeader;
-                let option = frame.x[1] as u32;
-                let send_size = frame.x[2] as u32;
-                let rcv_size = frame.x[3] as u32;
-                let rcv_name = frame.x[4] as u32;
-                let timeout = frame.x[5] as u32;
-                // notify is on stack? For now ignore.
+                // mach_reply_port
 
                 let mut sched = SCHEDULER.lock();
+
+                if let Some(space) = sched.current_ipc_space() {
+                    frame.x[0] = space.allocate_port() as u64;
+                } else {
+                    frame.x[0] = 0;
+                }
+            }
+
+            -27 => {
+                // thread_self_trap
+
+                frame.x[0] = 0x200; // Dummy thread port
+            }
+
+            -28 => {
+                // host_self_trap
+
+                frame.x[0] = 0x300; // Dummy host port
+            }
+
+            -31 => {
+                // mach_msg_trap(msg, option, send_size, rcv_size, rcv_name, timeout, notify)
+
+                let msg = frame.x[0] as *mut crate::ipc::MachMsgHeader;
+
+                let option = frame.x[1] as u32;
+
+                let send_size = frame.x[2] as u32;
+
+                let rcv_size = frame.x[3] as u32;
+
+                let rcv_name = frame.x[4] as u32;
+
+                let timeout = frame.x[5] as u32;
+
+                let mut sched = SCHEDULER.lock();
+
                 if let Some(space) = sched.current_ipc_space() {
                     frame.x[0] = crate::ipc::mach_msg(
                         msg, option, send_size, rcv_size, rcv_name, timeout, 0, space,
@@ -165,71 +205,330 @@ fn handle_a32_syscall(frame: &mut TrapFrame) {
                     frame.x[0] = 0x10000003 as u64; // MACH_PORT_UNKNOWN
                 }
             }
-            -28 => {
-                // mach_reply_port
-                let mut sched = SCHEDULER.lock();
-                if let Some(space) = sched.current_ipc_space() {
-                    frame.x[0] = space.allocate_port() as u64;
-                } else {
-                    frame.x[0] = 0;
-                }
-            }
+
             -3 => {
                 // mach_absolute_time
-                // Simple incrementing counter for now
+
                 static mut TIME: u64 = 0;
+
                 unsafe {
                     TIME += 100;
-                    // A32 returns 64-bit in R0:R1
+
                     frame.x[0] = (TIME & 0xFFFFFFFF) as u64;
+
                     frame.x[1] = (TIME >> 32) as u64;
                 }
             }
+
             _ => {
-                if r12 == -2147483648 {
-                    // This is 0x80000000. Might be some special private trap or error.
-                    // Return success for now to see if it unblocks.
+                if syscall_num as u32 == 0x80000000 {
                     frame.x[0] = 0;
                 } else {
-                    kprintln!("Unknown Mach A32 trap: {}", r12);
+                    kprintln!("Unknown Mach A32 trap: {}", syscall_num);
                 }
             }
         }
+
         return;
     }
 
-    // BSD Syscall
-    let syscall_num = if r12 != 0 { r12 } else { r7 };
-
     match syscall_num {
         1 => sys_exit(),
+
+        3 => {
+            // read(fd, buf, len)
+
+            let fd = frame.x[0] as usize;
+
+            let buf_ptr = frame.x[1] as *mut u8;
+
+            let len = frame.x[2] as usize;
+
+            let mut sched = SCHEDULER.lock();
+
+            let mut read_len = 0;
+
+            if let Some(proc) = sched.current_process.as_mut() {
+                if fd < proc.files.len() {
+                    if let Some(handle) = &mut proc.files[fd] {
+                        let slice = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
+
+                        read_len = handle.read(slice);
+                    }
+                }
+            }
+
+            frame.x[0] = read_len as u64;
+
+            frame.spsr &= !0x20000000;
+        }
+
         4 => sys_write(frame.x[0], frame.x[1], frame.x[2]),
+
         5 => {
             // open(path, flags, mode)
+
             let path_ptr = frame.x[0] as *const u8;
-            // For now, return ENOENT (2)
-            frame.x[0] = (-2i32) as u64;
-            // Darwin returns carry bit set for error?
-            frame.spsr |= 0x20000000; // Carry flag in CPSR (bit 29)
+
+            let mut path_buf = [0u8; 128];
+
+            let mut i = 0;
+
+            while i < 127 {
+                let c = unsafe { core::ptr::read(path_ptr.add(i)) };
+
+                if c == 0 {
+                    break;
+                }
+
+                path_buf[i] = c;
+
+                i += 1;
+            }
+
+            let path_str = core::str::from_utf8(&path_buf[..i]).unwrap_or("invalid");
+
+            kprintln!("sys_open: {}", path_str);
+
+            if let Some(handle) = crate::vfs::open(path_str) {
+                let mut sched = SCHEDULER.lock();
+
+                if let Some(proc) = sched.current_process.as_mut() {
+                    let mut found_fd = None;
+
+                    for (fd, slot) in proc.files.iter_mut().enumerate() {
+                        if slot.is_none() {
+                            *slot = Some(handle);
+
+                            found_fd = Some(fd);
+
+                            break;
+                        }
+                    }
+
+                    if let Some(fd) = found_fd {
+                        frame.x[0] = fd as u64;
+
+                        frame.spsr &= !0x20000000;
+                    } else {
+                        frame.x[0] = 24; // EMFILE
+
+                        frame.spsr |= 0x20000000;
+                    }
+                }
+            } else {
+                frame.x[0] = 2; // ENOENT
+
+                frame.spsr |= 0x20000000;
+            }
         }
+
+        6 => {
+            // close(fd)
+
+            let fd = frame.x[0] as usize;
+
+            let mut sched = SCHEDULER.lock();
+
+            if let Some(proc) = sched.current_process.as_mut() {
+                if fd < proc.files.len() {
+                    proc.files[fd] = None;
+                }
+            }
+
+            frame.x[0] = 0;
+
+            frame.spsr &= !0x20000000;
+        }
+
         20 => {
             // getpid
+
             frame.x[0] = SCHEDULER.lock().current_pid();
+
+            frame.spsr &= !0x20000000;
         }
+
+        24 => {
+            frame.x[0] = 0;
+            frame.spsr &= !0x20000000;
+        } // getuid
+
+        25 => {
+            frame.x[0] = 0;
+            frame.spsr &= !0x20000000;
+        } // geteuid
+
+        26 => {
+            frame.x[0] = 0;
+            frame.spsr &= !0x20000000;
+        } // getgid
+
+        33 => {
+            // access(path, mode)
+
+            frame.x[0] = 2; // ENOENT
+
+            frame.spsr |= 0x20000000;
+        }
+
+        43 => {
+            frame.x[0] = 0;
+            frame.spsr &= !0x20000000;
+        } // getegid
+
+        46 => {
+            // sigaction
+
+            frame.x[0] = 0;
+
+            frame.spsr &= !0x20000000;
+        }
+
+        48 => {
+            // sigprocmask
+
+            frame.x[0] = 0;
+
+            frame.spsr &= !0x20000000;
+        }
+
+        54 => {
+            // ioctl
+
+            frame.x[0] = 0;
+
+            frame.spsr &= !0x20000000;
+        }
+
+        73 => {
+            // munmap(addr, len)
+
+            frame.x[0] = 0;
+
+            frame.spsr &= !0x20000000;
+        }
+
+        74 => {
+            // mprotect(addr, len, prot)
+
+            frame.x[0] = 0;
+
+            frame.spsr &= !0x20000000;
+        }
+
         116 => {
             // gettimeofday
-            frame.x[0] = 0; // Success
+
+            frame.x[0] = 0;
+
+            frame.spsr &= !0x20000000;
         }
+
+        197 => {
+            // mmap(addr, len, prot, flags, fd, offset)
+
+            let addr = frame.x[0];
+
+            let len = frame.x[1];
+
+            let fd = frame.x[4] as i32;
+
+            let _offset = frame.x[5];
+
+            let map_addr = if addr == 0 {
+                static mut NEXT_MMAP: u64 = 0x70000000;
+
+                unsafe {
+                    let res = NEXT_MMAP;
+
+                    NEXT_MMAP += (len + 0xFFF) & !0xFFF;
+
+                    res
+                }
+            } else {
+                addr
+            };
+
+            crate::mmu::map_range(map_addr, map_addr, len, crate::mmu::MapPermission::UserRWX);
+
+            if fd != -1 {
+                let mut sched = SCHEDULER.lock();
+
+                if let Some(proc) = sched.current_process.as_mut() {
+                    let fd = fd as usize;
+
+                    if fd < proc.files.len() {
+                        if let Some(handle) = &mut proc.files[fd] {
+                            let slice = unsafe {
+                                core::slice::from_raw_parts_mut(map_addr as *mut u8, len as usize)
+                            };
+
+                            handle.read(slice);
+                        }
+                    }
+                }
+            }
+
+            frame.x[0] = map_addr;
+
+            frame.spsr &= !0x20000000;
+        }
+
+        202 => {
+            // sysctl
+
+            frame.x[0] = 0;
+
+            frame.spsr &= !0x20000000;
+        }
+
+        220 => {
+            // getattrlist
+
+            frame.x[0] = 2; // ENOENT
+
+            frame.spsr |= 0x20000000;
+        }
+
         327 => {
             // issetugid
+
             frame.x[0] = 0;
+
+            frame.spsr &= !0x20000000;
         }
+
+        338 => {
+            // stat64
+
+            frame.x[0] = 2; // ENOENT
+
+            frame.spsr |= 0x20000000;
+        }
+
+        339 => {
+            // fstat64
+
+            frame.x[0] = 2; // ENOENT
+
+            frame.spsr |= 0x20000000;
+        }
+
+        340 => {
+            // lstat64
+
+            frame.x[0] = 2; // ENOENT
+
+            frame.spsr |= 0x20000000;
+        }
+
         _ => {
             kprintln!(
-                "Unknown A32 syscall: R12={} R7={} R0={}",
-                r12,
-                r7,
-                frame.x[0]
+                "Unknown A32 syscall: num={} R0={:x} PC={:x}",
+                syscall_num,
+                frame.x[0],
+                frame.elr
             );
         }
     }

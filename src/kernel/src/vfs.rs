@@ -70,20 +70,37 @@ pub fn open(path: &str) -> Option<FileHandle> {
     }
 }
 
+use rand_chacha::ChaCha20Rng;
+use rand_core::{RngCore, SeedableRng};
+
+static mut RANDOM_RNG: Option<ChaCha20Rng> = None;
+
 struct RandomFile {
     pos: u64,
 }
 
 impl File for RandomFile {
     fn read(&mut self, buf: &mut [u8]) -> usize {
-        for b in buf.iter_mut() {
-            *b = 0x42; // Not very random, but good enough for a stub
+        unsafe {
+            let rng_ptr = core::ptr::addr_of_mut!(RANDOM_RNG);
+            if (*rng_ptr).is_none() {
+                *rng_ptr = Some(ChaCha20Rng::from_seed([0x42; 32]));
+            }
+            if let Some(ref mut rng) = *rng_ptr {
+                rng.fill_bytes(buf);
+            }
         }
         buf.len()
     }
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> usize {
-        for b in buf.iter_mut() {
-            *b = 0x42;
+        unsafe {
+            let rng_ptr = core::ptr::addr_of_mut!(RANDOM_RNG);
+            if (*rng_ptr).is_none() {
+                *rng_ptr = Some(ChaCha20Rng::from_seed([0x42; 32]));
+            }
+            if let Some(ref mut rng) = *rng_ptr {
+                rng.fill_bytes(buf);
+            }
         }
         buf.len()
     }

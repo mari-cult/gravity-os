@@ -106,17 +106,22 @@ pub extern "C" fn kmain() {
         file.read_to_end()
     };
     kprintln!("Parsing Mach-O binaries...");
-    let main_loader = macho::MachOLoader::load(&main_bin, load_offset);
+    let main_load_offset = 0x41000000;
+    let main_loader = macho::MachOLoader::load(&main_bin, main_load_offset);
     if let Some(loader) = main_loader {
         let mut loader_is_64bit = loader.is_64bit;
         let (entry, path) = if let Some(dyld_path) = loader.dylinker {
             kprintln!("Binary requests dylinker: {}", dyld_path);
+            let dyld_load_offset = 0x50000000;
             let dyld_loader =
-                macho::MachOLoader::load(&dyld_bin, load_offset).expect("Failed to load dyld");
+                macho::MachOLoader::load(&dyld_bin, dyld_load_offset).expect("Failed to load dyld");
             loader_is_64bit = dyld_loader.is_64bit;
             (dyld_loader.entry, dyld_path)
         } else {
-            (loader.entry + load_offset, String::from("/bin/initial"))
+            (
+                loader.entry + main_load_offset,
+                String::from("/bin/initial"),
+            )
         };
 
         // Allocate and map user stack

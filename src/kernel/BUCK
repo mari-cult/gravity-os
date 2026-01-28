@@ -10,6 +10,8 @@ rust_binary(
         "third-party//:goblin",
         "third-party//:linked_list_allocator",
         "third-party//:spin",
+        "third-party//:rand_chacha",
+        "third-party//:rand_core",
         "//src/lib/hfsplus:hfsplus",
     ],
     target_compatible_with = [

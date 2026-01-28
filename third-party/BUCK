@@ -3258,6 +3258,25 @@ cargo.rust_library(
 )
 
 http_archive(
+    name = "ppv-lite86-0.2.21.crate",
+    sha256 = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9",
+    strip_prefix = "ppv-lite86-0.2.21",
+    urls = ["https://static.crates.io/crates/ppv-lite86/0.2.21/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "ppv-lite86-0.2.21",
+    srcs = [":ppv-lite86-0.2.21.crate"],
+    crate = "ppv_lite86",
+    crate_root = "ppv-lite86-0.2.21.crate/src/lib.rs",
+    edition = "2021",
+    features = ["simd"],
+    visibility = [],
+    deps = [":zerocopy-0.8.35"],
+)
+
+http_archive(
     name = "proc-macro2-1.0.106.crate",
     sha256 = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934",
     strip_prefix = "proc-macro2-1.0.106",
@@ -3319,6 +3338,56 @@ cargo.rust_library(
     ],
     visibility = [],
     deps = [":proc-macro2-1.0.106"],
+)
+
+alias(
+    name = "rand_chacha",
+    actual = ":rand_chacha-0.9.0",
+    visibility = ["PUBLIC"],
+)
+
+http_archive(
+    name = "rand_chacha-0.9.0.crate",
+    sha256 = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb",
+    strip_prefix = "rand_chacha-0.9.0",
+    urls = ["https://static.crates.io/crates/rand_chacha/0.9.0/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "rand_chacha-0.9.0",
+    srcs = [":rand_chacha-0.9.0.crate"],
+    crate = "rand_chacha",
+    crate_root = "rand_chacha-0.9.0.crate/src/lib.rs",
+    edition = "2021",
+    visibility = [],
+    deps = [
+        ":ppv-lite86-0.2.21",
+        ":rand_core-0.9.5",
+    ],
+)
+
+alias(
+    name = "rand_core",
+    actual = ":rand_core-0.9.5",
+    visibility = ["PUBLIC"],
+)
+
+http_archive(
+    name = "rand_core-0.9.5.crate",
+    sha256 = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c",
+    strip_prefix = "rand_core-0.9.5",
+    urls = ["https://static.crates.io/crates/rand_core/0.9.5/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "rand_core-0.9.5",
+    srcs = [":rand_core-0.9.5.crate"],
+    crate = "rand_core",
+    crate_root = "rand_core-0.9.5.crate/src/lib.rs",
+    edition = "2021",
+    visibility = [],
 )
 
 alias(
@@ -5360,6 +5429,37 @@ cargo.rust_library(
         ":syn-2.0.114",
         ":synstructure-0.13.2",
     ],
+)
+
+http_archive(
+    name = "zerocopy-0.8.35.crate",
+    sha256 = "fdea86ddd5568519879b8187e1cf04e24fce28f7fe046ceecbce472ff19a2572",
+    strip_prefix = "zerocopy-0.8.35",
+    urls = ["https://static.crates.io/crates/zerocopy/0.8.35/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "zerocopy-0.8.35",
+    srcs = [":zerocopy-0.8.35.crate"],
+    crate = "zerocopy",
+    crate_root = "zerocopy-0.8.35.crate/src/lib.rs",
+    edition = "2021",
+    env = {
+        "CARGO_CRATE_NAME": "zerocopy",
+        "CARGO_MANIFEST_DIR": "zerocopy-0.8.35.crate",
+        "CARGO_PKG_AUTHORS": "Joshua Liebow-Feeser <joshlf@google.com>:Jack Wrenn <jswrenn@amazon.com>",
+        "CARGO_PKG_DESCRIPTION": "Zerocopy makes zero-cost memory manipulation effortless. We write \"unsafe\" so you don't have to.",
+        "CARGO_PKG_NAME": "zerocopy",
+        "CARGO_PKG_REPOSITORY": "https://github.com/google/zerocopy",
+        "CARGO_PKG_VERSION": "0.8.35",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "8",
+        "CARGO_PKG_VERSION_PATCH": "35",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    features = ["simd"],
+    visibility = [],
 )
 
 http_archive(
