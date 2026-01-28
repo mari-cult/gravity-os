@@ -27,3 +27,12 @@ platform(
     ],
     visibility = ["PUBLIC"],
 )
+
+platform(
+    name = "macos-arm64",
+    constraint_values = [
+        "prelude//cpu/constraints:arm64",
+        "prelude//os/constraints:macos",
+    ],
+    visibility = ["PUBLIC"],
+)

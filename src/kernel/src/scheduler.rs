@@ -28,10 +28,16 @@ pub struct Process {
 }
 
 impl Process {
-    pub fn new(entry_point: u64, user_sp: u64, args: &[u64], tls_base: u64) -> Self {
+    pub fn new(
+        entry_point: u64,
+        user_sp: u64,
+        args: &[u64],
+        tls_base: u64,
+        is_64bit: bool,
+    ) -> Self {
         let stack_size = 64 * 1024;
         let stack = vec![0u8; stack_size];
-        let sp = stack.as_ptr() as u64 + stack.len() as u64;
+        let sp = (stack.as_ptr() as u64 + stack.len() as u64) & !15;
 
         kprintln!(
             "Creating process: KStack top {:x}, UStack top {:x}",
@@ -61,9 +67,14 @@ impl Process {
         // Pass up to 6 args in x21..x26
         context.regs[2..(args.len().min(6) + 2)].copy_from_slice(&args[..args.len().min(6)]);
 
-        // AArch64 EL0
-        let flags = 0u64;
-        context.regs[8] = flags; // x27
+        // SPSR: Mask all DAIF bits (0x3c0)
+        // If 64-bit: EL0t (0x000)
+        // If 32-bit: User mode (0x010)
+        let mut spsr = 0x3c0u64;
+        if !is_64bit {
+            spsr |= 0x10;
+        }
+        context.regs[8] = spsr; // x27
 
         Self {
             pid: PID_COUNTER.fetch_add(1, Ordering::Relaxed),

@@ -1,27 +1,13 @@
-load(":rules.bzl", "ipsw_decrypt", "ipsw_download", "ipsw_extract", "make_disk_image")
+load(":rules.bzl", "qemu_run")
 
-ipsw_download(
-    name = "fetch_ipsw",
-    build = "9B206",
-    device = "iPad1,1",
-    output_name = "firmware.ipsw",
+qemu_run(
+    name = "run_qemu",
+    disk = "//:disk.img",
+    kernel = "//src/kernel:kernel",
 )
 
-ipsw_extract(
-    name = "extract_ipsw",
-    ipsw = ":fetch_ipsw",
-    output_dir_name = "extracted",
+alias(
+    name = "setup",
+    actual = "//src/tools/gravity-setup:gravity-setup",
 )
 
-ipsw_decrypt(
-    name = "decrypt_rootfs",
-    extracted_dir = ":extract_ipsw",
-    key = "f7bb9fd8aa3102484ab9c847dacfd3d73f1f430acb49ed7a422226f2410acee17664c91b",
-    output_name = "rootfs.dmg",
-)
-
-make_disk_image(
-    name = "disk",
-    output_name = "disk.img",
-    rootfs_dmg = ":decrypt_rootfs",
-)

@@ -1,6 +1,6 @@
 //! Simple Virtual Filesystem abstraction
 
-use crate::tarfs::TarFs;
+use crate::hfsfs::HfsFs;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -31,7 +31,7 @@ pub trait File: Send + Sync {
 }
 
 pub struct Vfs {
-    tarfs: Arc<TarFs>,
+    hfsfs: Arc<HfsFs>,
 }
 
 pub struct FileHandle {
@@ -39,17 +39,17 @@ pub struct FileHandle {
 }
 
 impl Vfs {
-    pub fn new(tarfs: TarFs) -> Self {
+    pub fn new(hfsfs: HfsFs) -> Self {
         Self {
-            tarfs: Arc::new(tarfs),
+            hfsfs: Arc::new(hfsfs),
         }
     }
 }
 
-/// Initialize the VFS with a TAR filesystem
-pub fn init(tarfs: TarFs) {
+/// Initialize the VFS with an HFS+ filesystem
+pub fn init(hfsfs: HfsFs) {
     let mut vfs = VFS.lock();
-    *vfs = Some(Vfs::new(tarfs));
+    *vfs = Some(Vfs::new(hfsfs));
 }
 
 /// Open a file by path
@@ -63,17 +63,9 @@ pub fn open(path: &str) -> Option<FileHandle> {
     let vfs = VFS.lock();
     let vfs = vfs.as_ref()?;
 
-    if let Some(file) = vfs.tarfs.open(path) {
+    if let Some(file) = vfs.hfsfs.open(path) {
         Some(FileHandle { file })
     } else {
-        if path.contains("IOKit") {
-            crate::kprintln!("VFS: Failed to find IOKit. Listing candidates:");
-            for file in vfs.tarfs.list() {
-                if file.name.contains("IOKit") || file.name.starts_with("System") {
-                    crate::kprintln!("  Candidate: '{}'", file.name);
-                }
-            }
-        }
         None
     }
 }

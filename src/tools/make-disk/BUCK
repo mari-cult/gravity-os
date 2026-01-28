@@ -4,11 +4,14 @@ rust_binary(
     crate_root = "src/main.rs",
     edition = "2024",
     deps = [
-        "third-party//:clap",
-        "third-party//:tar",
-        "third-party//:thiserror",
         "//src/lib/apple-dmg:apple-dmg",
         "//src/lib/hfsplus:hfsplus",
+        "third-party//:clap",
+        "third-party//:thiserror",
+        "third-party//:rayon",
+        "third-party//:flate2",
+        "third-party//:indicatif",
+        "third-party//:memmap2",
     ],
     visibility = ["PUBLIC"],
 )

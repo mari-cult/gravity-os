@@ -7,12 +7,13 @@ use {
     anyhow::Result,
     crc32fast::Hasher,
     fatfs::{Dir, FileSystem, FormatVolumeOptions, FsOptions, ReadWriteSeek},
-    flate2::{Compression, bufread::ZlibEncoder, read::ZlibDecoder},
+    flate2::{Compression, bufread::ZlibDecoder, bufread::ZlibEncoder},
     fscommon::BufStream,
     gpt::mbr::{PartRecord, ProtectiveMBR},
     std::{
+        collections::BTreeMap,
         fs::File,
-        io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
+        io::{BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
         path::Path,
     },
 };
@@ -31,12 +32,12 @@ pub struct DmgReader<R: Read + Seek> {
 
 impl DmgReader<BufReader<File>> {
     pub fn open(path: &Path) -> Result<Self> {
-        let r = BufReader::new(File::open(path)?);
+        let r = BufReader::with_capacity(10 * 1024 * 1024, File::open(path)?);
         Self::new(r)
     }
 }
 
-impl<R: Read + Seek> DmgReader<R> {
+impl<R: Read + Seek + BufRead> DmgReader<R> {
     pub fn new(mut r: R) -> Result<Self> {
         let koly = KolyTrailer::read_from(&mut r)?;
         r.seek(SeekFrom::Start(koly.plist_offset))?;
@@ -54,15 +55,22 @@ impl<R: Read + Seek> DmgReader<R> {
         &self.xml
     }
 
-    pub fn sector(&mut self, chunk: &BlkxChunk) -> Result<impl Read + '_> {
-        self.r.seek(SeekFrom::Start(chunk.compressed_offset))?;
-        let compressed_chunk = (&mut self.r).take(chunk.compressed_length);
-        match chunk.ty().expect("unknown chunk type") {
-            ChunkType::Ignore | ChunkType::Zero | ChunkType::Comment => {
-                Ok(Box::new(std::io::repeat(0).take(chunk.compressed_length)) as Box<dyn Read>)
+    pub fn sector(&mut self, chunk: &BlkxChunk) -> Result<Box<dyn Read + '_>> {
+        let ty = chunk.ty().expect("unknown chunk type");
+        match ty {
+            ChunkType::Ignore | ChunkType::Zero => {
+                Ok(Box::new(std::io::repeat(0).take(chunk.sector_count * 512)))
             }
-            ChunkType::Raw => Ok(Box::new(compressed_chunk)),
-            ChunkType::Zlib => Ok(Box::new(ZlibDecoder::new(compressed_chunk))),
+            ChunkType::Comment => Ok(Box::new(std::io::empty())),
+            ChunkType::Raw => {
+                self.r.seek(SeekFrom::Start(chunk.compressed_offset))?;
+                Ok(Box::new((&mut self.r).take(chunk.compressed_length)))
+            }
+            ChunkType::Zlib => {
+                self.r.seek(SeekFrom::Start(chunk.compressed_offset))?;
+                let compressed_chunk = (&mut self.r).take(chunk.compressed_length);
+                Ok(Box::new(ZlibDecoder::new(compressed_chunk)))
+            }
             ChunkType::Adc | ChunkType::Bzlib | ChunkType::Lzfse => unimplemented!(),
             ChunkType::Term => Ok(Box::new(std::io::empty())),
         }
@@ -92,6 +100,206 @@ impl<R: Read + Seek> DmgReader<R> {
             std::io::copy(&mut self.sector(chunk)?, &mut partition)?;
         }
         Ok(partition)
+    }
+
+    pub fn copy_partition_to<W: Write>(&mut self, i: usize, mut writer: W) -> Result<u64> {
+        let table = self.plist().partitions()[i].table()?;
+        let mut total = 0;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        for chunk in &table.chunks {
+            let mut sector_reader = self.sector(chunk)?;
+            loop {
+                let n = sector_reader.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                writer.write_all(&buffer[..n])?;
+                total += n as u64;
+            }
+        }
+        Ok(total)
+    }
+
+    pub fn into_partition_reader(self, i: usize) -> Result<DmgPartitionReader<R>> {
+        let table = self.plist().partitions()[i].table()?;
+        let total_size = table
+            .chunks
+            .iter()
+            .filter(|c| c.ty() != Some(ChunkType::Term))
+            .map(|c| c.sector_count * 512)
+            .sum::<u64>();
+        Ok(DmgPartitionReader {
+            r: self.r,
+            chunks: table.chunks,
+            pos: 0,
+            total_size,
+            cache: BTreeMap::new(),
+            cache_order: Vec::new(),
+        })
+    }
+}
+
+pub struct DmgPartitionReader<R: Read + Seek + BufRead> {
+    r: R,
+    chunks: Vec<BlkxChunk>,
+    pos: u64,
+    total_size: u64,
+    cache: BTreeMap<usize, Vec<u8>>,
+    cache_order: Vec<usize>,
+}
+
+const MAX_CACHE_CHUNKS: usize = 256;
+
+impl<R: Read + Seek + BufRead> DmgPartitionReader<R> {
+    fn get_chunk_at_pos(&self, pos: u64) -> Option<(usize, &BlkxChunk)> {
+        let sector = pos / 512;
+
+        // Fast path: check if we're still in the last accessed chunk or the next one
+        if let Some(&last_idx) = self.cache_order.last() {
+            let c = &self.chunks[last_idx];
+            if sector >= c.sector_number && sector < c.sector_number + c.sector_count {
+                return Some((last_idx, c));
+            }
+            // Try next chunk too for sequential access
+            if last_idx + 1 < self.chunks.len() {
+                let c = &self.chunks[last_idx + 1];
+                if sector >= c.sector_number && sector < c.sector_number + c.sector_count {
+                    return Some((last_idx + 1, c));
+                }
+            }
+        }
+
+        // Binary search for chunk
+        let result = self.chunks.binary_search_by(|c| {
+            if sector < c.sector_number {
+                std::cmp::Ordering::Greater
+            } else if sector >= c.sector_number + c.sector_count {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+
+        match result {
+            Ok(idx) => Some((idx, &self.chunks[idx])),
+            Err(_) => None,
+        }
+    }
+
+    fn load_chunk(&mut self, idx: usize) -> Result<()> {
+        if self.cache.contains_key(&idx) {
+            // Update cache order for LRU
+            if let Some(pos) = self.cache_order.iter().position(|&i| i == idx) {
+                self.cache_order.remove(pos);
+            }
+            self.cache_order.push(idx);
+            return Ok(());
+        }
+
+        let chunk = &self.chunks[idx];
+        let mut data = Vec::with_capacity((chunk.sector_count * 512) as usize);
+
+        let ty = chunk.ty().expect("unknown chunk type");
+        match ty {
+            ChunkType::Ignore | ChunkType::Zero => {
+                data.resize((chunk.sector_count * 512) as usize, 0);
+            }
+            ChunkType::Comment => {}
+            ChunkType::Raw => {
+                self.r.seek(SeekFrom::Start(chunk.compressed_offset))?;
+                data.resize(chunk.compressed_length as usize, 0);
+                self.r.read_exact(&mut data)?;
+            }
+            ChunkType::Zlib => {
+                self.r.seek(SeekFrom::Start(chunk.compressed_offset))?;
+                let compressed_chunk = (&mut self.r).take(chunk.compressed_length);
+                let mut decoder = ZlibDecoder::new(compressed_chunk);
+                decoder.read_to_end(&mut data)?;
+            }
+            _ => unimplemented!("Unsupported chunk type for seeking reader: {:?}", ty),
+        }
+
+        if self.cache.len() >= MAX_CACHE_CHUNKS {
+            if !self.cache_order.is_empty() {
+                let oldest = self.cache_order.remove(0);
+                self.cache.remove(&oldest);
+            }
+        }
+
+        self.cache.insert(idx, data);
+        self.cache_order.push(idx);
+        Ok(())
+    }
+}
+
+impl<R: Read + Seek + BufRead> Read for DmgPartitionReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let (idx, chunk_start_bytes, chunk_sector_count) = match self.get_chunk_at_pos(self.pos) {
+            Some((idx, chunk)) => (idx, chunk.sector_number * 512, chunk.sector_count),
+            None => return Ok(0),
+        };
+
+        if let Err(e) = self.load_chunk(idx) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ));
+        }
+
+        let chunk_data = &self.cache[&idx];
+        let offset_in_chunk = (self.pos - chunk_start_bytes) as usize;
+        let available = chunk_data.len().saturating_sub(offset_in_chunk);
+
+        if available == 0 {
+            self.pos = chunk_start_bytes + chunk_sector_count * 512;
+            return self.read(buf);
+        }
+
+        let n = std::cmp::min(buf.len(), available);
+        buf[..n].copy_from_slice(&chunk_data[offset_in_chunk..offset_in_chunk + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek + BufRead> Seek for DmgPartitionReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(s) => s as i64,
+            SeekFrom::Current(c) => self.pos as i64 + c,
+            SeekFrom::End(e) => self.total_size as i64 + e,
+        };
+
+        if new_pos < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "negative seek",
+            ));
+        }
+
+        self.pos = new_pos as u64;
+        Ok(self.pos)
+    }
+}
+
+impl<R: Read + Seek + BufRead> hfsplus::Read for DmgPartitionReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> hfsplus::Result<usize> {
+        Read::read(self, buf).map_err(|e| hfsplus::Error::InvalidData(e.to_string()))
+    }
+}
+
+impl<R: Read + Seek + BufRead> hfsplus::Seek for DmgPartitionReader<R> {
+    fn seek(&mut self, pos: hfsplus::SeekFrom) -> hfsplus::Result<u64> {
+        let std_pos = match pos {
+            hfsplus::SeekFrom::Start(s) => SeekFrom::Start(s),
+            hfsplus::SeekFrom::Current(c) => SeekFrom::Current(c),
+            hfsplus::SeekFrom::End(e) => SeekFrom::End(e),
+        };
+        Seek::seek(self, std_pos).map_err(|e| hfsplus::Error::InvalidData(e.to_string()))
     }
 }
 

@@ -1,4 +1,4 @@
-.section __TEXT,__text_boot
+.section .text.boot
 .global _start
 
 _start:

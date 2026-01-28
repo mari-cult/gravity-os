@@ -18,8 +18,20 @@ pub struct CpuContext {
     pub regs: [u64; 13], // x19..x28, x29, sp, x30
 }
 
+static mut EXCEPTION_COUNT: u32 = 0;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_sync_exception(frame: &mut TrapFrame) {
+    unsafe {
+        EXCEPTION_COUNT += 1;
+        if EXCEPTION_COUNT > 10 {
+            // Probably a loop in exception handler
+            loop {
+                asm!("wfe")
+            }
+        }
+    }
+
     let esr: u64;
     let far: u64;
     let sp_el0: u64;
@@ -101,10 +113,12 @@ fn dump_mem(addr: u64, len: u64) {
     for i in (0..len).step_by(16) {
         let curr = addr + i;
         // Basic safety check for known mapped user/kernel regions
-        if (0x30000000..0x80000000).contains(&curr) || (0x10000000..0x20000000).contains(&curr) {
-            // OK
-        } else {
-            // kprintln!("{:08x}: <unmapped>", curr);
+        // QEMU virt RAM: 0x40000000 - 0x80000000
+        // Peripheral/IO: 0x00000000 - 0x10000000 (roughly)
+        let is_ram = (0x40000000..0x80000000).contains(&curr);
+        let is_io = (0x09000000..0x09001000).contains(&curr); // UART
+
+        if !is_ram && !is_io {
             continue;
         }
 
@@ -173,7 +187,7 @@ fn sys_exit() {
 fn sys_spawn(fn_ptr: u64, arg: u64) -> u64 {
     let mut scheduler = SCHEDULER.lock();
     // For now, kernel-spawned threads in EL0
-    let process = crate::scheduler::Process::new(fn_ptr, 0, &[arg], 0);
+    let process = crate::scheduler::Process::new(fn_ptr, 0, &[arg], 0, true);
     let pid = process.pid;
     scheduler.add_process(process);
     pid
@@ -185,8 +199,11 @@ fn sys_getpid() -> u64 {
 
 pub fn init_vectors() {
     unsafe extern "C" {
+
         static vectors: u8;
+
     }
+
     unsafe {
         asm!("msr vbar_el1, {}", in(reg) &vectors);
     }

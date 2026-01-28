@@ -35,7 +35,9 @@ struct PageTable([u64; 512]);
 static mut L1_TABLE: PageTable = PageTable([0; 512]);
 static mut L2_TABLES: [PageTable; 4] = [PageTable([0; 512]); 4];
 
-// A small pool of L3 tables for fine-grained user mappings
+// Pool for dynamically allocated L2 and L3 tables
+static mut L2_POOL: [PageTable; 16] = [PageTable([0; 512]); 16];
+static mut L2_ALLOC_IDX: usize = 0;
 static mut L3_POOL: [PageTable; 256] = [PageTable([0; 512]); 256];
 static mut L3_ALLOC_IDX: usize = 0;
 
@@ -52,20 +54,21 @@ pub fn init() {
             L1_TABLE.0[i] = 0;
         }
         for i in 0..4 {
-            for j in 0..512 {
-                L2_TABLES[i].0[j] = 0;
-            }
-        }
-
-        for i in 0..4 {
             // L1[i] -> L2_TABLES[i]
             L1_TABLE.0[i] = (core::ptr::addr_of!(L2_TABLES[i]) as u64) | DESC_VALID | DESC_TABLE;
 
             for j in 0..512 {
                 let paddr = (i as u64 * 1024 * 1024 * 1024) + (j as u64 * 0x200000);
 
-                // Map first 1GB as Device (MAIR_DEV), rest as Normal (MAIR_MEM)
-                let attr = if i == 0 { MAIR_DEV } else { MAIR_MEM };
+                // Skip mapping PCI space (0x10000000 - 0x40000000) as Normal memory
+                // We will map these specifically as Device memory later
+                if paddr >= 0x10000000 && paddr < 0x40000000 {
+                    continue;
+                }
+
+                // Map everything as Normal (MAIR_MEM) for now to ensure kernel code/stack work
+                // MAIR Index 1 is Normal memory
+                let attr = MAIR_MEM;
                 L2_TABLES[i].0[j] = paddr | DESC_VALID | DESC_BLOCK | attr | AF | AP_RW_EL1;
             }
         }
@@ -103,6 +106,26 @@ pub fn init() {
         asm!("dsb sy", "isb");
     }
 
+    // Map UART specifically as Device memory
+    // UART is at 0x09000000
+    map_range(0x09000000, 0x09000000, 4096, MapPermission::KernelRWDevice);
+
+    // Map PCI ECAM (0x3f000000)
+    map_range(
+        0x3f000000,
+        0x3f000000,
+        0x1000000,
+        MapPermission::KernelRWDevice,
+    );
+
+    // Map PCI MMIO space (0x10000000+)
+    map_range(
+        0x10000000,
+        0x10000000,
+        0x10000000,
+        MapPermission::KernelRWDevice,
+    );
+
     // Map CommPage at 0xFFFF0000
     // CommPage needs to be UserRO
     map_range(
@@ -119,6 +142,7 @@ pub static mut COMMPAGE_STORAGE: [u8; 4096] = [0; 4096];
 pub enum MapPermission {
     KernelRW,
     KernelRO,
+    KernelRWDevice,
     UserRW,
     UserRO,
     UserRX,
@@ -129,6 +153,7 @@ fn get_ap_bits(perm: MapPermission) -> u64 {
     match perm {
         MapPermission::KernelRW => AP_RW_EL1,
         MapPermission::KernelRO => AP_RO_EL1,
+        MapPermission::KernelRWDevice => AP_RW_EL1,
         MapPermission::UserRW => AP_RW_EL0_EL1,
         MapPermission::UserRO => AP_RO_EL0_EL1,
         MapPermission::UserRX => AP_RO_EL0_EL1,
@@ -141,6 +166,7 @@ fn get_xn_bits(perm: MapPermission) -> u64 {
         MapPermission::UserRX => PXN, // UserRX means EL1 cannot exec, EL0 can.
         MapPermission::UserRWX => PXN,
         MapPermission::UserRO | MapPermission::UserRW => UXN | PXN,
+        MapPermission::KernelRWDevice => UXN | PXN,
         _ => UXN, // Kernel default
     }
 }
@@ -156,29 +182,47 @@ pub fn map_range(vaddr: u64, paddr: u64, size: u64, perm: MapPermission) {
         let l3_idx = ((curr_v >> 12) & 0x1FF) as usize;
 
         unsafe {
-            if l1_idx >= 4 {
+            if l1_idx >= 512 {
                 continue;
             }
 
             // Ensure L2 exists
             if (L1_TABLE.0[l1_idx] & DESC_VALID) == 0 {
-                L1_TABLE.0[l1_idx] =
-                    (core::ptr::addr_of!(L2_TABLES[l1_idx]) as u64) | DESC_VALID | DESC_TABLE;
+                // Allocate from L2_POOL
+                if L2_ALLOC_IDX >= 16 {
+                    panic!("Out of L2 tables!");
+                }
+                let l2_table_ptr = &mut L2_POOL[L2_ALLOC_IDX];
+                L2_ALLOC_IDX += 1;
+                // Zero out the new table
+                for entry in l2_table_ptr.0.iter_mut() {
+                    *entry = 0;
+                }
+                let l2_table_addr = l2_table_ptr as *const _ as u64;
+                L1_TABLE.0[l1_idx] = l2_table_addr | DESC_VALID | DESC_TABLE;
             }
 
+            let l2_ptr = (L1_TABLE.0[l1_idx] & TABLE_ADDR_MASK) as *mut PageTable;
+
             // Ensure L3 exists (pointing from L2)
-            let l2_entry = L2_TABLES[l1_idx].0[l2_idx];
+            let l2_entry = (*l2_ptr).0[l2_idx];
             if (l2_entry & DESC_VALID) == 0 {
                 // New table
-                let l3_table_addr = &L3_POOL[L3_ALLOC_IDX] as *const _ as u64;
-                L3_ALLOC_IDX += 1;
                 if L3_ALLOC_IDX >= 256 {
                     panic!("Out of L3 tables!");
                 }
+                let l3_table_ptr = &mut L3_POOL[L3_ALLOC_IDX];
+                L3_ALLOC_IDX += 1;
+                // Zero out the new table
+                for entry in l3_table_ptr.0.iter_mut() {
+                    *entry = 0;
+                }
+                let l3_table_addr = l3_table_ptr as *const _ as u64;
 
-                L2_TABLES[l1_idx].0[l2_idx] = l3_table_addr | DESC_VALID | DESC_TABLE;
+                (*l2_ptr).0[l2_idx] = l3_table_addr | DESC_VALID | DESC_TABLE;
             } else if (l2_entry & DESC_TABLE) == 0 {
                 // It was a block mapping! Split it.
+                kprintln!("MMU: Splitting block at vaddr {:x}", curr_v & !0x1FFFFF);
                 // For 2MB blocks, the address is at bits [47:21]
                 let block_paddr = l2_entry & BLOCK_ADDR_MASK;
                 let block_flags = l2_entry & !TABLE_ADDR_MASK;
@@ -201,18 +245,21 @@ pub fn map_range(vaddr: u64, paddr: u64, size: u64, perm: MapPermission) {
                 }
 
                 core::ptr::write_volatile(
-                    &mut L2_TABLES[l1_idx].0[l2_idx],
+                    &mut (*l2_ptr).0[l2_idx],
                     (&L3_POOL[l3_idx_to_use] as *const _ as u64) | DESC_VALID | DESC_TABLE,
                 );
             }
 
-            let l3_ptr = (L2_TABLES[l1_idx].0[l2_idx] & TABLE_ADDR_MASK) as *mut PageTable;
+            let l3_ptr = ((*l2_ptr).0[l2_idx] & TABLE_ADDR_MASK) as *mut PageTable;
             let ap = get_ap_bits(perm);
             let xn = get_xn_bits(perm);
+            let is_device = perm == MapPermission::KernelRWDevice;
+            let attr = if is_device { MAIR_DEV } else { MAIR_MEM };
+            let sh = if is_device { 0 } else { SH_INNER };
 
             core::ptr::write_volatile(
                 &mut (*l3_ptr).0[l3_idx],
-                curr_p | DESC_VALID | DESC_PAGE | MAIR_MEM | AF | SH_INNER | ap | xn,
+                curr_p | DESC_VALID | DESC_PAGE | attr | AF | sh | ap | xn,
             );
 
             // Debug: verify first mapping

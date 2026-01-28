@@ -1,6 +1,7 @@
 //! Virtio-blk driver using PCI transport for QEMU virt machine
 
-use crate::tarfs::BlockReader;
+use crate::block::BlockReader;
+use crate::kprintln;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -228,15 +229,23 @@ fn pci_assign_bar(bus: u8, dev: u8, func: u8, bar_num: u8) -> u32 {
 }
 
 fn scan_pci() -> Option<(u8, u8, u8, VirtioCaps)> {
+    kprintln!("Virtio: Scanning PCI bus...");
     for dev in 0..32 {
         let vendor = pci_read16(0, dev, 0, PCI_VENDOR_ID);
         if vendor == 0xFFFF {
             continue;
         }
         let device = pci_read16(0, dev, 0, PCI_DEVICE_ID);
+        kprintln!(
+            "PCI: Found device {:04x}:{:04x} at 0:{}:0",
+            vendor,
+            device,
+            dev
+        );
         if vendor == VIRTIO_VENDOR_ID
             && (device == VIRTIO_BLK_DEVICE_ID_LEGACY || device == VIRTIO_BLK_DEVICE_ID_MODERN)
         {
+            kprintln!("Virtio: Found blk device, enabling...");
             let cmd = pci_read16(0, dev, 0, PCI_COMMAND);
             pci_write16(0, dev, 0, PCI_COMMAND, cmd | 0x06);
             if let Some(caps) = find_virtio_caps(0, dev, 0) {
@@ -254,11 +263,13 @@ fn scan_pci() -> Option<(u8, u8, u8, VirtioCaps)> {
 impl VirtioBlk {
     pub fn new() -> Option<Self> {
         let (bus, dev, func, caps) = scan_pci()?;
+        kprintln!("Virtio: Blk device configured, BARs assigned");
         let bar_offset = PCI_BAR0 + (caps.common_cfg_bar as usize) * 4;
         let bar = pci_read32(bus, dev, func, bar_offset) & !0xF;
         if bar == 0 {
             return None;
         }
+        kprintln!("Virtio: BAR at {:x}", bar);
         let common_cfg = bar as usize + caps.common_cfg_offset as usize;
         let notify_cap_base = bar as usize + caps.notify_offset as usize;
 
@@ -268,6 +279,7 @@ impl VirtioBlk {
             write_volatile((common_cfg + VIRTIO_PCI_COMMON_STATUS) as *mut u8, status);
             status |= VIRTIO_STATUS_DRIVER;
             write_volatile((common_cfg + VIRTIO_PCI_COMMON_STATUS) as *mut u8, status);
+            kprintln!("Virtio: Status set to DRIVER");
             write_volatile((common_cfg + VIRTIO_PCI_COMMON_GFSELECT) as *mut u32, 1);
             write_volatile(
                 (common_cfg + VIRTIO_PCI_COMMON_GF) as *mut u32,
@@ -275,6 +287,15 @@ impl VirtioBlk {
             );
             status |= VIRTIO_STATUS_FEATURES_OK;
             write_volatile((common_cfg + VIRTIO_PCI_COMMON_STATUS) as *mut u8, status);
+
+            // Check status
+            let check = read_volatile((common_cfg + VIRTIO_PCI_COMMON_STATUS) as *const u8);
+            if (check & VIRTIO_STATUS_FEATURES_OK) == 0 {
+                kprintln!("Virtio: Features NOT OK ({:x})", check);
+                return None;
+            }
+            kprintln!("Virtio: Features OK");
+
             write_volatile((common_cfg + VIRTIO_PCI_COMMON_Q_SELECT) as *mut u16, 0);
             write_volatile(
                 (common_cfg + VIRTIO_PCI_COMMON_Q_SIZE) as *mut u16,
@@ -321,6 +342,8 @@ impl VirtioBlk {
             let status_layout = alloc::alloc::Layout::from_size_align(4, 4).unwrap();
             let status_buf = alloc::alloc::alloc(status_layout);
 
+            kprintln!("Virtio: Blk device ready");
+
             Some(Self {
                 notify_addr,
                 desc,
@@ -341,6 +364,7 @@ impl VirtioBlk {
     }
 
     pub fn read_sectors(&mut self, sector: u64, buf: &mut [u8]) -> bool {
+        // kprintln!("Virtio: read_sectors sector={} len={}", sector, buf.len());
         if !buf.len().is_multiple_of(512) {
             return false;
         }
@@ -393,6 +417,7 @@ impl VirtioBlk {
             }
             self.last_used_idx = (*self.used).idx;
             cache_invalidate_range(buf.as_ptr() as usize, buf.len());
+            // kprintln!("Virtio: read_sectors complete");
             *self.status_buf == 0
         }
     }

@@ -4,9 +4,11 @@ rust_library(
     crate_root = "lib.rs",
     edition = "2024",
     deps = [
-        "third-party//:byteorder",
         "third-party//:bitflags",
         "third-party//:unicode-normalization",
+        "third-party//:hashbrown",
+        "third-party//:binrw",
+        "third-party//:spin",
     ],
     visibility = ["PUBLIC"],
 )

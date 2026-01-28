@@ -1,12 +1,14 @@
 use crate::kprintln;
 use alloc::string::String;
 use alloc::vec;
+use alloc::vec::Vec;
 use goblin::mach::{Mach, MachO};
 
 pub struct MachOLoader {
     pub entry: u64,
     pub header_addr: u64,
     pub dylinker: Option<String>,
+    pub is_64bit: bool,
 }
 
 pub fn setup_stack(sp: u64, exec_path: &str, mh_addr: u64) -> u64 {
@@ -80,15 +82,23 @@ impl MachOLoader {
         match mach {
             Mach::Binary(macho) => Self::load_macho(&macho, data, load_offset),
             Mach::Fat(fat) => {
-                // Find arm64 slice
-                for arch in fat.arches().ok()? {
-                    if arch.cputype == goblin::mach::constants::cputype::CPU_TYPE_ARM64 {
-                        let offset = arch.offset as usize;
-                        let size = arch.size as usize;
-                        let slice = &data[offset..offset + size];
-                        let macho = MachO::parse(slice, 0).ok()?;
-                        return Self::load_macho(&macho, slice, load_offset);
-                    }
+                let arches = fat.arches().ok()?;
+                // Prefer arm64 if available, otherwise armv7
+                let arch = arches
+                    .iter()
+                    .find(|a| a.cputype == goblin::mach::constants::cputype::CPU_TYPE_ARM64)
+                    .or_else(|| {
+                        arches
+                            .iter()
+                            .find(|a| a.cputype == goblin::mach::constants::cputype::CPU_TYPE_ARM)
+                    });
+
+                if let Some(arch) = arch {
+                    let offset = arch.offset as usize;
+                    let size = arch.size as usize;
+                    let slice = &data[offset..offset + size];
+                    let macho = MachO::parse(slice, 0).ok()?;
+                    return Self::load_macho(&macho, slice, load_offset);
                 }
                 None
             }
@@ -96,7 +106,12 @@ impl MachOLoader {
     }
 
     fn load_macho(macho: &MachO, data: &[u8], load_offset: u64) -> Option<Self> {
-        kprintln!("Loading Mach-O binary with slide {:x}...", load_offset);
+        let is_64bit = macho.header.cputype == goblin::mach::constants::cputype::CPU_TYPE_ARM64;
+        kprintln!(
+            "Loading Mach-O binary (64-bit: {}) with slide {:x}...",
+            is_64bit,
+            load_offset
+        );
 
         let mut dylinker = None;
 
@@ -178,8 +193,12 @@ impl MachOLoader {
 
         Some(Self {
             entry: macho.entry + load_offset,
+
             header_addr,
+
             dylinker,
+
+            is_64bit,
         })
     }
 }

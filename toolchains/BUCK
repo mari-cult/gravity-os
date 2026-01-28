@@ -19,11 +19,12 @@ system_rust_toolchain(
     rustc_target_triple = select({
         "prelude//cpu/constraints:arm64": select({
             "prelude//os/constraints:macos": "aarch64-apple-darwin",
-            "prelude//os/constraints:none": "aarch64-apple-darwin",
+            "prelude//os/constraints:none": "aarch64-unknown-none-softfloat",
         }),
         "prelude//cpu/constraints:x86_64": "x86_64-unknown-linux-gnu",
     }),
     rustc_flags = [
+        "-Copt-level=3",
         "-Cpanic=abort",
         "-Crelocation-model=pic",
         "-Cunsafe-allow-abi-mismatch=sanitizer",

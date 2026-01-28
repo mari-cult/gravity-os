@@ -1,4 +1,4 @@
-.section __TEXT,__text
+.section .text
 .global vectors
 .global internal_exception_handler
 

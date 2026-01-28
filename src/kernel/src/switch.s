@@ -74,9 +74,8 @@ kernel_thread_starter:
     /* Set TLS (x28 holds tls_base) */
     msr tpidr_el0, x28
 
-    /* SPSR_EL1: EL0t, IRQ/FIQ masked */
-    mov x28, #0x3c0
-    msr spsr_el1, x28
+    /* SPSR_EL1 from flags (x27) */
+    msr spsr_el1, x27
 
     /* Barriers */
     dsb ish

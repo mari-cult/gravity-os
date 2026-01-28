@@ -4,6 +4,7 @@ rust_library(
     crate_root = "lib.rs",
     edition = "2024",
     deps = [
+        "//src/lib/hfsplus:hfsplus",
         "third-party//:anyhow",
         "third-party//:byteorder",
         "third-party//:crc32fast",

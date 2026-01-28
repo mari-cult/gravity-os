@@ -4,13 +4,15 @@
 // Enable alloc crate
 extern crate alloc;
 
+mod block;
 mod heap;
+mod hfsfs;
 mod ipc;
 mod macho;
+mod mem;
 mod mmu;
 mod process;
 mod scheduler;
-mod tarfs;
 mod uart;
 mod vfs;
 mod virtio;
@@ -35,6 +37,8 @@ pub extern "C" fn kmain() {
     mmu::init();
 
     heap::init_heap();
+
+    kprintln!("Heap initialized");
 
     kprintln!("Vectors initialized");
 
@@ -66,32 +70,12 @@ pub extern "C" fn kmain() {
         // Initialize VFS from disk (at 400MB offset)
         kprintln!("Initializing VFS from disk...");
         let blk_shared = alloc::sync::Arc::new(spin::Mutex::new(blk));
-        let tarfs = tarfs::TarFs::new(blk_shared, 400 * 1024 * 1024);
-        kprintln!("Found {} files in rootfs", tarfs.list().len());
-        vfs::init(tarfs);
+        let hfsfs = hfsfs::HfsFs::new(blk_shared, 400 * 1024 * 1024);
+        vfs::init(hfsfs);
+        kprintln!("VFS initialized");
     } else {
         kprintln!("No virtio disk found");
     }
-
-    // if !shared_cache_data.is_empty() {
-    //     if macho::MachOLoader::map_shared_cache(shared_cache_data).is_none() {
-    //         kprintln!("Shared cache mapping failed/invalid. Mapping dummy range at 0x30000000");
-    //         crate::mmu::map_range(
-    //             0x3000_0000,
-    //             0x5000_0000,
-    //             0x200000, // 2MB
-    //             crate::mmu::MapPermission::UserRO,
-    //         );
-    //     }
-    // } else {
-    //     kprintln!("Shared cache empty. Mapping dummy range at 0x30000000");
-    //     crate::mmu::map_range(
-    //         0x3000_0000,
-    //         0x5000_0000,
-    //         0x200000, // 2MB
-    //         crate::mmu::MapPermission::UserRO,
-    //     );
-    // }
 
     // Note: 0x40000000 seems to be used by dyld for CommPage or similar absolute reference.
     // We move the app to 0x4000_0000.
@@ -131,20 +115,55 @@ pub extern "C" fn kmain() {
         );
     }
 
+    kprintln!("Opening /sbin/launchd...");
     let main_bin = {
         let mut file = vfs::open("/sbin/launchd").expect("Failed to open launchd");
-        file.read_to_end()
+        kprintln!("Reading /sbin/launchd ({} bytes)...", file.size());
+        let data = file.read_to_end();
+        if data.len() >= 16 {
+            kprintln!(
+                "launchd header: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                data[0],
+                data[1],
+                data[2],
+                data[3],
+                data[4],
+                data[5],
+                data[6],
+                data[7]
+            );
+        }
+        data
     };
+    kprintln!("Opening /usr/lib/dyld...");
     let dyld_bin = {
         let mut file = vfs::open("/usr/lib/dyld").expect("Failed to open dyld");
-        file.read_to_end()
+        kprintln!("Reading /usr/lib/dyld ({} bytes)...", file.size());
+        let data = file.read_to_end();
+        if data.len() >= 16 {
+            kprintln!(
+                "dyld header: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                data[0],
+                data[1],
+                data[2],
+                data[3],
+                data[4],
+                data[5],
+                data[6],
+                data[7]
+            );
+        }
+        data
     };
+    kprintln!("Parsing Mach-O binaries...");
     let main_loader = macho::MachOLoader::load(&main_bin, load_offset);
     if let Some(loader) = main_loader {
+        let mut loader_is_64bit = loader.is_64bit;
         let (entry, path) = if let Some(dyld_path) = loader.dylinker {
             kprintln!("Binary requests dylinker: {}", dyld_path);
             let dyld_loader =
                 macho::MachOLoader::load(&dyld_bin, load_offset).expect("Failed to load dyld");
+            loader_is_64bit = dyld_loader.is_64bit;
             (dyld_loader.entry, dyld_path)
         } else {
             (loader.entry + load_offset, String::from("/bin/initial"))
@@ -194,7 +213,7 @@ pub extern "C" fn kmain() {
         // Allocate TLS page (4KB), ensuring 4KB alignment
         let (tls_base, tls_size) = {
             let size = 4096;
-            use alloc::alloc::{alloc_zeroed, Layout};
+            use alloc::alloc::{Layout, alloc_zeroed};
             let layout = Layout::from_size_align(size, 4096).unwrap();
             let ptr = unsafe { alloc_zeroed(layout) };
             if ptr.is_null() {
@@ -219,11 +238,20 @@ pub extern "C" fn kmain() {
             core::ptr::write(tls_base as *mut u32, tls_base as u32);
         }
 
-        let process = Process::new(entry, new_sp, &args, tls_base);
+        let process = Process::new(entry, new_sp, &args, tls_base, loader_is_64bit);
+        let pid = process.pid;
 
         let mut sched = SCHEDULER.lock();
         sched.add_process(process);
         sched.schedule_next();
+
+        kprintln!(
+            "Ready to switch to PID {} at {:x} (SP: {:x}, SPSR: {:x})",
+            pid,
+            entry,
+            new_sp,
+            sched.current_process.as_ref().unwrap().context.regs[8]
+        );
     } else {
         panic!("Failed to parse MAIN_BIN");
     }
@@ -249,6 +277,8 @@ pub extern "C" fn kmain() {
             fn __switch_to(prev: *mut process::CpuContext, next: *const process::CpuContext);
         }
         __switch_to(&mut boot_ctx, next_ctx_ptr);
+
+        kprintln!("ERROR: __switch_to returned to kmain!");
     }
 
     kprintln!(
