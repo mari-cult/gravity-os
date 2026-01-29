@@ -38,15 +38,15 @@ static mut L2_TABLES: [PageTable; 4] = [PageTable([0; 512]); 4];
 // Pool for dynamically allocated L2 and L3 tables
 static mut L2_POOL: [PageTable; 16] = [PageTable([0; 512]); 16];
 static mut L2_ALLOC_IDX: usize = 0;
-static mut L3_POOL: [PageTable; 256] = [PageTable([0; 512]); 256];
+static mut L3_POOL: [PageTable; 2048] = [PageTable([0; 512]); 2048];
 static mut L3_ALLOC_IDX: usize = 0;
 
 pub fn init() {
     kprintln!("MMU: Initializing 3-level hierarchy (T0SZ=32)...");
 
     unsafe {
-        // 1. MAIR_EL1: Index 0=Device, Index 1=Normal
-        let mair: u64 = 0x0000_0000_0000_FF04; // Attr0=Device, Attr1=Normal
+        // 1. MAIR_EL1: Index 0=Device, Index 1=Normal Non-Cacheable
+        let mair: u64 = 0x0000_0000_0000_4404; // Attr0=Device, Attr1=Normal NC
         asm!("msr mair_el1, {}", in(reg) mair);
 
         // 2. Map 4GB using L1 -> L2 (2MB blocks)
@@ -69,14 +69,15 @@ pub fn init() {
                 // Map everything as Normal (MAIR_MEM) for now to ensure kernel code/stack work
                 // MAIR Index 1 is Normal memory
                 let attr = MAIR_MEM;
-                L2_TABLES[i].0[j] = paddr | DESC_VALID | DESC_BLOCK | attr | AF | AP_RW_EL1;
+                L2_TABLES[i].0[j] =
+                    paddr | DESC_VALID | DESC_BLOCK | attr | AF | SH_INNER | AP_RW_EL1;
             }
         }
 
         asm!("dsb sy");
 
-        // 3. TCR_EL1: T0SZ=32, TG0=4KB, EPD1=1, WBWA, Shareable, etc.
-        let tcr: u64 = 0x5b5103520;
+        // 3. TCR_EL1: T0SZ=32, TG0=4KB, EPD1=1, Non-cacheable walks
+        let tcr: u64 = 0x5b5103020; // ORGN0=00, IRGN0=00
         asm!("msr tcr_el1, {}", in(reg) tcr);
 
         // 4. TTBR0_EL1: Point to L1_TABLE
@@ -117,11 +118,12 @@ pub fn init() {
     // UART is at 0x09000000
     map_range(0x09000000, 0x09000000, 4096, MapPermission::KernelRWDevice);
 
-    // Map PCI ECAM (0x3f000000)
+    // Map PCI ECAM (Virtual 0x20000000 -> Physical 0x40_1000_0000)
+    // Highmem ECAM is 256MB
     map_range(
-        0x3f000000,
-        0x3f000000,
-        0x1000000,
+        0x20000000,
+        0x40_1000_0000,
+        0x10000000,
         MapPermission::KernelRWDevice,
     );
 
@@ -159,6 +161,123 @@ fn populate_commpage() {
 }
 
 pub static mut COMMPAGE_STORAGE: [u8; 65536] = [0; 65536];
+static mut ZERO_PAGE: [u8; 4096] = [0; 4096];
+static mut ZERO_L3_TABLE: PageTable = PageTable([0; 512]);
+static mut ZERO_MMU_INIT: bool = false;
+
+fn init_zero_mmu() {
+    unsafe {
+        if ZERO_MMU_INIT {
+            return;
+        }
+        let paddr = core::ptr::addr_of!(ZERO_PAGE) as u64;
+        let attr = MAIR_MEM;
+        let sh = SH_INNER;
+        let ap = AP_RO_EL0_EL1; // Default to User RO
+        let xn = UXN | PXN;
+        for i in 0..512 {
+            ZERO_L3_TABLE.0[i] = paddr | DESC_VALID | DESC_PAGE | attr | AF | sh | ap | xn;
+        }
+        ZERO_MMU_INIT = true;
+    }
+}
+
+pub fn map_zero_range(vaddr: u64, size: u64, perm: MapPermission) {
+    init_zero_mmu();
+    unsafe {
+        let start_v = vaddr & !0xFFF;
+        let end_v = core::cmp::min(0x1_0000_0000, (vaddr + size + 0xFFF) & !0xFFF);
+
+        let mut curr_v = start_v;
+        while curr_v < end_v {
+            let l1_idx = (curr_v >> 30) as usize;
+            let l2_idx = ((curr_v >> 21) & 0x1FF) as usize;
+            let l3_idx = ((curr_v >> 12) & 0x1FF) as usize;
+
+            if l1_idx >= 512 {
+                break;
+            }
+
+            // Optimization: If we are 1GB aligned and have at least 1GB left,
+            // we could theoretically point L1 to a shared L2 table.
+            // But for now, let's just ensure L2 exists.
+            let mut l1_entry = core::ptr::read_volatile(&L1_TABLE.0[l1_idx]);
+            if (l1_entry & DESC_VALID) == 0 {
+                if L2_ALLOC_IDX >= 16 {
+                    panic!("Out of L2 tables!");
+                }
+                let l2_table_ptr = &mut L2_POOL[L2_ALLOC_IDX];
+                L2_ALLOC_IDX += 1;
+                for entry in l2_table_ptr.0.iter_mut() {
+                    *entry = 0;
+                }
+                l1_entry = (l2_table_ptr as *const _ as u64) | DESC_VALID | DESC_TABLE;
+                core::ptr::write_volatile(&mut L1_TABLE.0[l1_idx], l1_entry);
+            }
+
+            let l2_ptr = (l1_entry & TABLE_ADDR_MASK) as *mut PageTable;
+
+            // Optimization: If we are 2MB aligned and have at least 2MB left, use ZERO_L3_TABLE
+            if curr_v & 0x1FFFFF == 0 && (end_v - curr_v) >= 0x200000 {
+                let l2_entry =
+                    (core::ptr::addr_of!(ZERO_L3_TABLE) as u64) | DESC_VALID | DESC_TABLE;
+                core::ptr::write_volatile(&mut (*l2_ptr).0[l2_idx], l2_entry);
+                curr_v += 0x200000;
+                continue;
+            }
+
+            let mut l2_entry = core::ptr::read_volatile(&(*l2_ptr).0[l2_idx]);
+            if (l2_entry & DESC_VALID) == 0 {
+                if L3_ALLOC_IDX >= 2048 {
+                    panic!("Out of L3 tables!");
+                }
+                let l3_table_ptr = &mut L3_POOL[L3_ALLOC_IDX];
+                L3_ALLOC_IDX += 1;
+                for entry in l3_table_ptr.0.iter_mut() {
+                    *entry = 0;
+                }
+                l2_entry = (l3_table_ptr as *const _ as u64) | DESC_VALID | DESC_TABLE;
+                core::ptr::write_volatile(&mut (*l2_ptr).0[l2_idx], l2_entry);
+            } else if (l2_entry & DESC_TABLE) == 0 {
+                // Split block
+                let block_paddr = l2_entry & BLOCK_ADDR_MASK;
+                let block_flags = l2_entry & !TABLE_ADDR_MASK;
+                if L3_ALLOC_IDX >= 2048 {
+                    panic!("Out of L3 tables!");
+                }
+                let l3_idx_to_use = L3_ALLOC_IDX;
+                L3_ALLOC_IDX += 1;
+                for p in 0..512 {
+                    core::ptr::write_volatile(
+                        &mut L3_POOL[l3_idx_to_use].0[p],
+                        (block_paddr + (p as u64 * 0x1000))
+                            | DESC_VALID
+                            | DESC_PAGE
+                            | (block_flags & !DESC_TABLE),
+                    );
+                }
+                l2_entry = (&L3_POOL[l3_idx_to_use] as *const _ as u64) | DESC_VALID | DESC_TABLE;
+                core::ptr::write_volatile(&mut (*l2_ptr).0[l2_idx], l2_entry);
+            }
+
+            let l3_ptr = (l2_entry & TABLE_ADDR_MASK) as *mut PageTable;
+            let ap = get_ap_bits(perm);
+            let xn = get_xn_bits(perm);
+            let attr = MAIR_MEM;
+            let sh = SH_INNER;
+            let paddr = core::ptr::addr_of!(ZERO_PAGE) as u64;
+
+            core::ptr::write_volatile(
+                &mut (*l3_ptr).0[l3_idx],
+                paddr | DESC_VALID | DESC_PAGE | attr | AF | sh | ap | xn,
+            );
+
+            curr_v += 0x1000;
+        }
+
+        asm!("dsb ish", "tlbi vmalle1is", "dsb ish", "isb");
+    }
+}
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum MapPermission {
@@ -177,16 +296,18 @@ fn get_ap_bits(perm: MapPermission) -> u64 {
         MapPermission::KernelRO => AP_RO_EL1,
         MapPermission::KernelRWDevice => AP_RW_EL1,
         MapPermission::UserRW => AP_RW_EL0_EL1,
-        MapPermission::UserRO => AP_RO_EL0_EL1,
-        MapPermission::UserRX => AP_RO_EL0_EL1,
+        MapPermission::UserRO => AP_RW_EL0_EL1, // Force RW for RO pages too (dyld self-modifying)
+        MapPermission::UserRX => AP_RW_EL0_EL1, // Force RW for RX pages too
         MapPermission::UserRWX => AP_RW_EL0_EL1,
     }
 }
 
 fn get_xn_bits(perm: MapPermission) -> u64 {
     match perm {
-        MapPermission::UserRX | MapPermission::UserRWX => 0, // Both EL0 and EL1 can execute (PXN=0, UXN=0)
-        MapPermission::UserRO | MapPermission::UserRW => UXN | PXN,
+        MapPermission::UserRX
+        | MapPermission::UserRWX
+        | MapPermission::UserRW
+        | MapPermission::UserRO => 0, // Allow execution for all user pages for now (dyld hacks)
         MapPermission::KernelRWDevice => UXN | PXN,
         MapPermission::KernelRO | MapPermission::KernelRW => UXN, // Kernel non-exec
     }
@@ -194,21 +315,24 @@ fn get_xn_bits(perm: MapPermission) -> u64 {
 
 pub fn map_range(vaddr: u64, paddr: u64, size: u64, perm: MapPermission) {
     let start_v = vaddr & !0xFFF;
-    let end_v = (vaddr + size + 0xFFF) & !0xFFF;
+    let end_v = core::cmp::min(0x1_0000_0000, (vaddr + size + 0xFFF) & !0xFFF);
     let mut curr_p = paddr & !0xFFF;
 
-    for curr_v in (start_v..end_v).step_by(0x1000) {
+    let mut curr_v = start_v;
+    while curr_v < end_v {
         let l1_idx = (curr_v >> 30) as usize;
         let l2_idx = ((curr_v >> 21) & 0x1FF) as usize;
         let l3_idx = ((curr_v >> 12) & 0x1FF) as usize;
 
         unsafe {
             if l1_idx >= 512 {
+                curr_v += 0x1000;
                 continue;
             }
 
             // Ensure L2 exists
-            if (L1_TABLE.0[l1_idx] & DESC_VALID) == 0 {
+            let mut l1_entry = core::ptr::read_volatile(&L1_TABLE.0[l1_idx]);
+            if (l1_entry & DESC_VALID) == 0 {
                 // Allocate from L2_POOL
                 if L2_ALLOC_IDX >= 16 {
                     panic!("Out of L2 tables!");
@@ -220,16 +344,34 @@ pub fn map_range(vaddr: u64, paddr: u64, size: u64, perm: MapPermission) {
                     *entry = 0;
                 }
                 let l2_table_addr = l2_table_ptr as *const _ as u64;
-                L1_TABLE.0[l1_idx] = l2_table_addr | DESC_VALID | DESC_TABLE;
+                l1_entry = l2_table_addr | DESC_VALID | DESC_TABLE;
+                core::ptr::write_volatile(&mut L1_TABLE.0[l1_idx], l1_entry);
             }
 
-            let l2_ptr = (L1_TABLE.0[l1_idx] & TABLE_ADDR_MASK) as *mut PageTable;
+            let l2_ptr = (l1_entry & TABLE_ADDR_MASK) as *mut PageTable;
+            let ap = get_ap_bits(perm);
+            let xn = get_xn_bits(perm);
+            let is_device = perm == MapPermission::KernelRWDevice;
+            let attr = if is_device { MAIR_DEV } else { MAIR_MEM };
+            let sh = if is_device { 0 } else { SH_INNER };
+
+            // Can we do a 2MB block mapping?
+            // Needs to be 2MB aligned (both V and P) and size must be at least 2MB.
+            if curr_v & 0x1FFFFF == 0 && curr_p & 0x1FFFFF == 0 && (end_v - curr_v) >= 0x200000 {
+                core::ptr::write_volatile(
+                    &mut (*l2_ptr).0[l2_idx],
+                    curr_p | DESC_VALID | DESC_BLOCK | attr | AF | sh | ap | xn,
+                );
+                curr_v += 0x200000;
+                curr_p += 0x200000;
+                continue;
+            }
 
             // Ensure L3 exists (pointing from L2)
-            let l2_entry = (*l2_ptr).0[l2_idx];
+            let mut l2_entry = core::ptr::read_volatile(&(*l2_ptr).0[l2_idx]);
             if (l2_entry & DESC_VALID) == 0 {
                 // New table
-                if L3_ALLOC_IDX >= 256 {
+                if L3_ALLOC_IDX >= 2048 {
                     panic!("Out of L3 tables!");
                 }
                 let l3_table_ptr = &mut L3_POOL[L3_ALLOC_IDX];
@@ -240,19 +382,20 @@ pub fn map_range(vaddr: u64, paddr: u64, size: u64, perm: MapPermission) {
                 }
                 let l3_table_addr = l3_table_ptr as *const _ as u64;
 
-                (*l2_ptr).0[l2_idx] = l3_table_addr | DESC_VALID | DESC_TABLE;
+                l2_entry = l3_table_addr | DESC_VALID | DESC_TABLE;
+                core::ptr::write_volatile(&mut (*l2_ptr).0[l2_idx], l2_entry);
             } else if (l2_entry & DESC_TABLE) == 0 {
                 // It was a block mapping! Split it.
-                kprintln!("MMU: Splitting block at vaddr {:x}", curr_v & !0x1FFFFF);
+                // kprintln!("MMU: Splitting block at vaddr {:x}", curr_v & !0x1FFFFF);
                 // For 2MB blocks, the address is at bits [47:21]
                 let block_paddr = l2_entry & BLOCK_ADDR_MASK;
                 let block_flags = l2_entry & !TABLE_ADDR_MASK;
 
-                let l3_idx_to_use = L3_ALLOC_IDX;
-                L3_ALLOC_IDX += 1;
-                if L3_ALLOC_IDX >= 256 {
+                if L3_ALLOC_IDX >= 2048 {
                     panic!("Out of L3 tables!");
                 }
+                let l3_idx_to_use = L3_ALLOC_IDX;
+                L3_ALLOC_IDX += 1;
 
                 // Populate the new L3 table with 512 pages from the block
                 for p in 0..512 {
@@ -265,38 +408,19 @@ pub fn map_range(vaddr: u64, paddr: u64, size: u64, perm: MapPermission) {
                     );
                 }
 
-                core::ptr::write_volatile(
-                    &mut (*l2_ptr).0[l2_idx],
-                    (&L3_POOL[l3_idx_to_use] as *const _ as u64) | DESC_VALID | DESC_TABLE,
-                );
+                l2_entry = (&L3_POOL[l3_idx_to_use] as *const _ as u64) | DESC_VALID | DESC_TABLE;
+                core::ptr::write_volatile(&mut (*l2_ptr).0[l2_idx], l2_entry);
             }
 
-            let l3_ptr = ((*l2_ptr).0[l2_idx] & TABLE_ADDR_MASK) as *mut PageTable;
-            let ap = get_ap_bits(perm);
-            let xn = get_xn_bits(perm);
-            let is_device = perm == MapPermission::KernelRWDevice;
-            let attr = if is_device { MAIR_DEV } else { MAIR_MEM };
-            let sh = if is_device { 0 } else { SH_INNER };
+            let l3_ptr = (l2_entry & TABLE_ADDR_MASK) as *mut PageTable;
 
             core::ptr::write_volatile(
                 &mut (*l3_ptr).0[l3_idx],
                 curr_p | DESC_VALID | DESC_PAGE | attr | AF | sh | ap | xn,
             );
 
-            // Debug: verify first and last mapping
-            if curr_v == start_v || curr_v + 0x1000 >= end_v {
-                kprintln!(
-                    "map_range: v={:x} p={:x} L1={} L2={} L3={} entry={:016x}",
-                    curr_v,
-                    curr_p,
-                    l1_idx,
-                    l2_idx,
-                    l3_idx,
-                    core::ptr::read_volatile(&(*l3_ptr).0[l3_idx])
-                );
-            }
-
             curr_p += 0x1000;
+            curr_v += 0x1000;
         }
     }
 

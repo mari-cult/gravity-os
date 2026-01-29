@@ -1,7 +1,11 @@
 [package]
 name = "dyld"
-version = "0.1.0"
-edition = "2021"
+version = "0.1.5"
+edition = "2024"
+
+[[bin]]
+name = "dyld"
+path = "src/main.rs"
 
 [dependencies]
 goblin = { workspace = true }

@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "dyld"
-version = "0.1.0"
+version = "0.1.5"
 dependencies = [
  "bitflags 2.10.0",
  "goblin",
@@ -1069,6 +1069,7 @@ dependencies = [
  "rand_chacha",
  "rand_core",
  "spin",
+ "zstd",
 ]
 
 [[package]]

@@ -1,27 +1,17 @@
+ENTRY(dyld_entry)
 SECTIONS
 {
-    . = 0x3FFFF000; /* Match load_offset in kernel */
-
-    .text : {
-        KEEP(*(.text.entry))
-        *(.text*)
+    . = 0x200000;
+    .text : ALIGN(4096) { 
+        *(.text*) 
     }
-
-    .rodata : {
-        *(.rodata*)
+    .rodata : ALIGN(4096) { 
+        *(.rodata*) 
     }
-
-    .data : {
-        *(.data*)
+    .data : ALIGN(4096) { 
+        *(.data*) 
     }
-
-    .bss : {
-        *(.bss*)
-        *(COMMON)
-    }
-
-    /DISCARD/ : {
-        *(.comment)
-        *(.note*)
+    .bss : ALIGN(4096) { 
+        *(.bss*) 
     }
 }

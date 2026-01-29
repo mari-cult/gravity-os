@@ -19,13 +19,26 @@ pub struct CpuContext {
 }
 
 static mut EXCEPTION_COUNT: u32 = 0;
+static mut IN_EXCEPTION: bool = false;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_sync_exception(frame: &mut TrapFrame) {
     unsafe {
+        if IN_EXCEPTION {
+            // Recursive exception!
+            kprintln!(
+                "RECURSIVE EXCEPTION! SPSR: {:x} PC: {:x} FAR: {:x}",
+                frame.spsr,
+                frame.elr,
+                0 // FAR
+            );
+            loop {
+                asm!("wfe")
+            }
+        }
+        IN_EXCEPTION = true;
         EXCEPTION_COUNT += 1;
-        if EXCEPTION_COUNT > 100 {
-            // Probably a loop in exception handler
+        if EXCEPTION_COUNT > 1000 {
             loop {
                 asm!("wfe")
             }
@@ -89,10 +102,16 @@ pub extern "C" fn handle_sync_exception(frame: &mut TrapFrame) {
                 dump_mem(far & !0x3F, 128);
             }
 
+            unsafe {
+                IN_EXCEPTION = false;
+            }
             loop {
                 unsafe { asm!("wfe") }
             }
         }
+    }
+    unsafe {
+        IN_EXCEPTION = false;
     }
 }
 
@@ -126,7 +145,7 @@ fn dump_mem(addr: u64, len: u64) {
         // Basic safety check for known mapped user/kernel regions
         let is_ram = (0x20000000..0x80000000).contains(&curr);
         let is_io = (0x09000000..0x09001000).contains(&curr); // UART
-        let is_low = (0..0x1000000).contains(&curr); // Low mem (app)
+        let is_low = (0..0x20000000).contains(&curr); // Low mem (app + dyld + heap)
         let is_sc = (0x30000000..0x40000000).contains(&curr); // Shared cache
 
         if !is_ram && !is_io && !is_low && !is_sc {
@@ -226,6 +245,20 @@ fn handle_a32_mach_trap(frame: &mut TrapFrame, syscall_num: i32, _iss: u32) {
             let rcv_name = frame.x[4] as u32;
             let timeout = frame.x[5] as u32;
 
+            if !msg.is_null() && (option & crate::ipc::MACH_SEND_MSG) != 0 {
+                let h = unsafe { *msg };
+                kprintln!(
+                    "mach_msg_trap SEND: id={:x} remote={:x} local={:x} size={:x} bits={:x}",
+                    h.msgh_id,
+                    h.msgh_remote_port,
+                    h.msgh_local_port,
+                    h.msgh_size,
+                    h.msgh_bits
+                );
+                // Dump first 24 bytes of message
+                dump_mem(frame.x[0], 24);
+            }
+
             let mut sched = SCHEDULER.lock();
             if let Some(space) = sched.current_ipc_space() {
                 let res = crate::ipc::mach_msg(
@@ -237,6 +270,16 @@ fn handle_a32_mach_trap(frame: &mut TrapFrame, syscall_num: i32, _iss: u32) {
                         let mut header = core::ptr::read_volatile(msg);
                         header.msgh_local_port = rcv_name;
                         core::ptr::write_volatile(msg, header);
+
+                        kprintln!(
+                            "mach_msg_trap RCV: id={:x} remote={:x} local={:x} size={:x} bits={:x}",
+                            header.msgh_id,
+                            header.msgh_remote_port,
+                            header.msgh_local_port,
+                            header.msgh_size,
+                            header.msgh_bits
+                        );
+                        dump_mem(frame.x[0], 24);
                     }
                 }
                 res as u64
@@ -380,13 +423,18 @@ fn handle_a32_syscall_internal(frame: &mut TrapFrame, syscall_num: i32) {
         }
         37 => {
             // kill
-            kprintln!(
-                "A32 Syscall: num=37 (kill) pid={} sig={}",
-                frame.x[0],
-                frame.x[1]
-            );
+            let pid = frame.x[0] as i32;
+            let sig = frame.x[1] as i32;
+            kprintln!("A32 Syscall: num=37 (kill) pid={} sig={}", pid, sig);
             frame.x[0] = 0;
             frame.spsr &= !0x20000000;
+
+            if sig == 6 || sig == 9 {
+                kprintln!("Process {} killed/aborted. Stopping execution.", pid);
+                loop {
+                    unsafe { asm!("wfe") }
+                }
+            }
         }
         43 => {
             frame.x[0] = 20;
@@ -669,9 +717,24 @@ fn handle_a32_syscall_internal(frame: &mut TrapFrame, syscall_num: i32) {
             frame.spsr |= 0x20000000;
         }
         274 => {
-            // sysctlbyname
-            frame.x[0] = 0;
-            frame.spsr &= !0x20000000;
+            // sysctlbyname(name, oldp, oldlenp, newp, newlen)
+            let name_ptr = frame.x[0] as *const u8;
+            let mut name_buf = [0u8; 64];
+            let mut i = 0;
+            while i < 63 {
+                let c = unsafe { core::ptr::read(name_ptr.add(i)) };
+                if c == 0 {
+                    break;
+                }
+                name_buf[i] = c;
+                i += 1;
+            }
+            if let Ok(name) = core::str::from_utf8(&name_buf[..i]) {
+                kprintln!("A32 Syscall: num=274 (sysctlbyname) name='{}'", name);
+            }
+
+            frame.x[0] = 2; // ENOENT
+            frame.spsr |= 0x20000000;
         }
         281 => {
             // sigaltstack
@@ -679,10 +742,50 @@ fn handle_a32_syscall_internal(frame: &mut TrapFrame, syscall_num: i32) {
             frame.spsr &= !0x20000000;
         }
         294 => {
-            // shared_region_check_np
-            kprintln!("A32 Syscall: num=294 (shared_region_check_np) -> ENOSYS");
-            frame.x[0] = 78; // ENOSYS
-            frame.spsr |= 0x20000000;
+            // shared_region_check_np(uint64_t *start_address)
+            kprintln!(
+                "A32 Syscall: num=294 (shared_region_check_np) ptr={:x}",
+                frame.x[0]
+            );
+            let ptr = frame.x[0] as *mut u64;
+            // Return the address where we mapped the cache
+            unsafe {
+                *ptr = 0x30000000;
+            }
+            frame.x[0] = 0; // Success
+            frame.spsr &= !0x20000000;
+        }
+        -3 => {
+            // mach_absolute_time()
+            // Return a monotonic time. For now, just a counter or generic large number.
+            // AArch32 result in r0:r1.
+            static mut TIME_COUNTER: u64 = 0x8000;
+            let t = unsafe {
+                TIME_COUNTER += 1000;
+                TIME_COUNTER
+            };
+            frame.x[0] = t & 0xFFFFFFFF; // r0
+            frame.x[1] = (t >> 32) & 0xFFFFFFFF; // r1
+            frame.spsr &= !0x20000000;
+        }
+        -11 => {
+            // mach_vm_read(target_task, address, size, &data, &msg_type)
+            // This is complex as it involves VM copy.
+            // For now, let's claim success but return 0 bytes read?
+            // Or maybe just ENOTSUP (46) if it's not critical.
+            // The crash at 2fe17e1f right after might suggest it expects valid return values.
+            // Let's print arguments.
+            kprintln!(
+                "mach_vm_read: task={} addr={:x} size={:x} data_ptr={:x}",
+                frame.x[0],
+                frame.x[1],
+                frame.x[2],
+                frame.x[3]
+            );
+
+            // Return KERN_FAILURE (5) to indicate we didn't read anything
+            frame.x[0] = 5;
+            frame.spsr &= !0x20000000;
         }
         301 => {
             // psynch_mutexwait
@@ -702,8 +805,8 @@ fn handle_a32_syscall_internal(frame: &mut TrapFrame, syscall_num: i32) {
         }
         327 => {
             // issetugid
-            kprintln!("A32 Syscall: num=327 (issetugid)");
-            frame.x[0] = 1;
+            kprintln!("A32 Syscall: num=327 (issetugid) -> 0");
+            frame.x[0] = 0;
             frame.spsr &= !0x20000000;
         }
         338 => {
@@ -802,11 +905,16 @@ fn handle_a32_syscall_internal(frame: &mut TrapFrame, syscall_num: i32) {
             let count = frame.x[1] as usize;
             let mappings = frame.x[2] as *const crate::ipc::SharedRegionMapping;
 
+            let slide = frame.x[3] as usize;
+
             kprintln!(
-                "A32 Syscall: num=438 (shared_region_map_and_slide_np) fd={} count={}",
+                "A32 Syscall: num=438 (shared_region_map_and_slide_np) fd={} count={} mappings_ptr={:x} slide={:x}",
                 fd,
-                count
+                count,
+                frame.x[2],
+                slide
             );
+            dump_mem(frame.x[2], count as u64 * 32);
 
             let mut sched = SCHEDULER.lock();
             if let Some(proc) = sched.current_process.as_mut() {
@@ -824,16 +932,34 @@ fn handle_a32_syscall_internal(frame: &mut TrapFrame, syscall_num: i32) {
                             );
 
                             // Only allocate/load what's actually in the file
-                            let data_size = if m.file_offset < file_size {
+                            let data_size_unaligned = if m.file_offset < file_size {
                                 core::cmp::min(m.size, file_size - m.file_offset)
                             } else {
                                 0
                             };
+                            let mut data_size =
+                                core::cmp::min(m.size, (data_size_unaligned + 4095) & !4095);
 
+                            // CLIP: Do not map into kernel space (> 1GB)
+                            let max_user_addr = 0x40000000;
+                            if m.address >= max_user_addr {
+                                kprintln!("  Skipping segment outside user range: {:x}", m.address);
+                                continue;
+                            }
+                            if m.address + data_size > max_user_addr {
+                                kprintln!(
+                                    "  Clipping data part from {:x} to {:x}",
+                                    m.address + data_size,
+                                    max_user_addr
+                                );
+                                data_size = max_user_addr - m.address;
+                            }
+
+                            // Map the data part (file-backed)
                             if data_size > 0 {
-                                // Allocate physical memory for the data part from heap
+                                let alloc_size = (data_size + 4095) & !4095;
                                 let layout =
-                                    core::alloc::Layout::from_size_align(data_size as usize, 4096)
+                                    core::alloc::Layout::from_size_align(alloc_size as usize, 4096)
                                         .unwrap();
                                 let phys_ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
                                 if phys_ptr.is_null() {
@@ -844,38 +970,64 @@ fn handle_a32_syscall_internal(frame: &mut TrapFrame, syscall_num: i32) {
                                 }
                                 let paddr = phys_ptr as u64;
 
-                                // Map it
-                                crate::mmu::map_range(
-                                    m.address,
-                                    paddr,
-                                    data_size,
-                                    crate::mmu::MapPermission::UserRWX,
-                                );
-
-                                // Read data from shared cache file in 4KB chunks
+                                // Read data from shared cache file into the physical buffer
                                 handle.seek(m.file_offset);
-                                let total_to_read = data_size as usize;
+                                let total_to_read =
+                                    core::cmp::min(data_size_unaligned, data_size) as usize;
                                 let mut offset = 0;
                                 while offset < total_to_read {
-                                    let chunk_size = core::cmp::min(4096, total_to_read - offset);
+                                    let chunk_size =
+                                        core::cmp::min(1024 * 1024, total_to_read - offset);
                                     let slice = unsafe {
                                         core::slice::from_raw_parts_mut(
-                                            (m.address as usize + offset) as *mut u8,
+                                            (phys_ptr as usize + offset) as *mut u8,
                                             chunk_size,
                                         )
                                     };
                                     handle.read(slice);
                                     offset += chunk_size;
                                 }
-                            }
 
-                            if m.size > data_size {
-                                kprintln!(
-                                    "  Segment {:x} has {:x} bytes of virtual padding",
+                                // Now map the data part to the user's address
+                                crate::mmu::map_range(
                                     m.address,
-                                    m.size - data_size
+                                    paddr,
+                                    data_size,
+                                    crate::mmu::MapPermission::UserRWX,
                                 );
                             }
+
+                            // If there is virtual padding (BSS/Zero-fill), map it as zeroed pages
+                            // DISABLED: This was overwriting adjacent segments due to large padding ranges in Segment 4
+                            /*
+                            if m.size > data_size {
+                                let mut padding_size = m.size - data_size;
+                                let padding_addr = m.address + data_size;
+
+                                if padding_addr < max_user_addr {
+                                    if padding_addr + padding_size > max_user_addr {
+                                        kprintln!(
+                                            "  Clipping padding from {:x} to {:x}",
+                                            padding_addr + padding_size,
+                                            max_user_addr
+                                        );
+                                        padding_size = max_user_addr - padding_addr;
+                                    }
+
+                                    kprintln!(
+                                        "  Mapping padding: addr={:x} size={:x}",
+                                        padding_addr,
+                                        padding_size
+                                    );
+                                    // Use map_zero_range to avoid physical allocations for padding
+                                    crate::mmu::map_zero_range(
+                                        padding_addr,
+                                        padding_size,
+                                        crate::mmu::MapPermission::UserRWX,
+                                    );
+                                }
+                            }
+                            */
 
                             kprintln!("  Mapped segment {:x} successfully", m.address);
                         }
@@ -888,10 +1040,12 @@ fn handle_a32_syscall_internal(frame: &mut TrapFrame, syscall_num: i32) {
         }
         _ => {
             kprintln!(
-                "Unknown A32 syscall: num={} R0={:x} PC={:x}",
+                "Unknown A32 syscall: num={} R0={:x} PC={:x} SP={:x} LR={:x}",
                 syscall_num,
                 frame.x[0],
-                frame.elr
+                frame.elr,
+                frame.x[13],
+                frame.x[14]
             );
             kprintln!("Code at PC:");
             dump_mem((frame.elr & !0xF).saturating_sub(32), 64);
@@ -918,7 +1072,9 @@ fn sys_write(fd: u64, buf: u64, len: u64) {
     if fd == 1 || fd == 2 || fd == 4 {
         let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
         if let Ok(s) = core::str::from_utf8(slice) {
-            kprintln!("sys_write: {}", s);
+            kprintln!("sys_write(fd={}): {}", fd, s);
+        } else {
+            kprintln!("sys_write(fd={}): [Binary Data] {:?}", fd, slice);
         }
     }
 }
@@ -950,7 +1106,7 @@ fn sys_exit() {
 fn sys_spawn(fn_ptr: u64, arg: u64) -> u64 {
     let mut scheduler = SCHEDULER.lock();
     // For now, kernel-spawned threads in EL0
-    let process = crate::scheduler::Process::new(fn_ptr, 0, &[arg], 0, true);
+    let process = crate::scheduler::Process::new(fn_ptr, 0, core::slice::from_ref(&arg), 0, true);
     let pid = process.pid;
     scheduler.add_process(process);
     pid

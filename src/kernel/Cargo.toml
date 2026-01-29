@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "zedos-kernel"
+name = "kernel"
 path = "src/main.rs"
 
 [dependencies]
@@ -14,3 +14,4 @@ spin = { workspace = true }
 rand_chacha = { workspace = true }
 rand_core = { workspace = true }
 hfsplus = { path = "../lib/hfsplus" }
+zstd = { workspace = true }

@@ -1,7 +1,0 @@
-rust_binary(
-    name = "linker-wrapper",
-    srcs = ["main.rs"],
-    crate_root = "main.rs",
-    edition = "2024",
-    visibility = ["PUBLIC"],
-)

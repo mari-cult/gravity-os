@@ -1,3 +1,4 @@
+use crate::kprintln;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -139,9 +140,9 @@ pub fn mach_msg(
 
                 unsafe {
                     core::ptr::copy_nonoverlapping(data.as_ptr(), msg as *mut u8, size);
-                    (*msg).msgh_size = size as u32;
+                    // Header is already in the data, but we might need to update some fields
+                    // relative to the receiver's view.
                     (*msg).msgh_local_port = rcv_name;
-                    (*msg).msgh_remote_port = 0; // Kernel
                 }
                 return MACH_MSG_SUCCESS;
             } else {
@@ -159,29 +160,40 @@ fn handle_host_rpc(header: &MachMsgHeader, _msg: *mut MachMsgHeader, space: &mut
     let reply_port_name = header.msgh_local_port;
     if let Some(port) = space.get_port(reply_port_name) {
         let mut p = port.lock();
-        let mut reply = alloc::vec![0u8; 128];
+        let mut reply = alloc::vec![0u8; 256];
         let r_hdr = reply.as_mut_ptr() as *mut MachMsgHeader;
         unsafe {
             (*r_hdr).msgh_bits = 0x12; // MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0)
-            (*r_hdr).msgh_remote_port = 1; // From Host port
+            (*r_hdr).msgh_remote_port = 0; // Kernel/Host
             (*r_hdr).msgh_local_port = reply_port_name;
             (*r_hdr).msgh_id = header.msgh_id + 100;
+
+            // Get flavor (first int after header)
+            let flavor = *(_msg as *const i32).add(6);
+            kprintln!("Host RPC id={} flavor={}", header.msgh_id, flavor);
 
             match header.msgh_id {
                 3409 => {
                     // host_info
-                    (*r_hdr).msgh_size = 48;
+                    (*r_hdr).msgh_size = 100; // Larger buffer
                     let data_ptr = reply.as_mut_ptr().add(24) as *mut i32;
                     unsafe {
-                        core::ptr::write_bytes(data_ptr, 0, 24);
+                        core::ptr::write_bytes(data_ptr, 0, 76);
 
-                        // host_basic_info (6 fields = 24 bytes)
-                        *data_ptr = 1; // max_cpus
-                        *data_ptr.add(1) = 1; // avail_cpus
-                        *data_ptr.add(2) = 1024 * 1024 * 1024; // memory_size
-                        *data_ptr.add(3) = 12; // cpu_type: ARM
-                        *data_ptr.add(4) = 9; // cpu_subtype: V7
-                        *data_ptr.add(5) = 1; // cpu_threadtype
+                        if flavor == 1 {
+                            // HOST_BASIC_INFO
+                            *data_ptr = 1; // max_cpus
+                            *data_ptr.add(1) = 1; // avail_cpus
+                            *data_ptr.add(2) = 1024 * 1024 * 1024; // memory_size
+                            *data_ptr.add(3) = 12; // cpu_type: ARM
+                            *data_ptr.add(4) = 9; // cpu_subtype: V7
+                            *data_ptr.add(5) = 1; // cpu_threadtype
+                            *data_ptr.add(6) = 1; // physical_cpu
+                            *data_ptr.add(7) = 1; // physical_cpu_max
+                            *data_ptr.add(8) = 1; // logical_cpu
+                            *data_ptr.add(9) = 1; // logical_cpu_max
+                            *(data_ptr.add(10) as *mut u64) = 1024 * 1024 * 1024; // max_mem
+                        }
                     }
                 }
                 3402 => {
@@ -207,6 +219,7 @@ fn handle_host_rpc(header: &MachMsgHeader, _msg: *mut MachMsgHeader, space: &mut
                     (*r_hdr).msgh_size = 24;
                 }
             }
+            reply.truncate((*r_hdr).msgh_size as usize);
         }
         // Keep queue size small
         if p.messages.len() > 10 {

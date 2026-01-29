@@ -24,10 +24,8 @@ impl<'a> MachOContext<'a> {
     pub fn find_symbol(&self, name: &str) -> Option<usize> {
         for sym in self.macho.symbols() {
             if let Ok((sym_name, nlist)) = sym {
-                if sym_name == name {
-                    if nlist.n_value != 0 {
-                        return Some(nlist.n_value as usize + self.slide);
-                    }
+                if sym_name == name && nlist.n_value != 0 {
+                    return Some(nlist.n_value as usize + self.slide);
                 }
             }
         }
@@ -37,7 +35,7 @@ impl<'a> MachOContext<'a> {
     pub unsafe fn apply_relocations(
         &mut self,
         libraries: &[MachOContext<'a>],
-        cache: &SharedCache,
+        cache: Option<&SharedCache>,
     ) -> Result<(), &'static str> {
         let slide = self.slide;
         for cmd in &self.macho.load_commands {
@@ -45,18 +43,22 @@ impl<'a> MachOContext<'a> {
                 &cmd.command
             {
                 if dyld_info.rebase_size > 0 {
-                    let rebase_data = slice::from_raw_parts(
-                        (self.base_addr + dyld_info.rebase_off as usize) as *const u8,
-                        dyld_info.rebase_size as usize,
-                    );
-                    self.perform_rebase(rebase_data, slide)?;
+                    let rebase_data = unsafe {
+                        slice::from_raw_parts(
+                            (self.base_addr + dyld_info.rebase_off as usize) as *const u8,
+                            dyld_info.rebase_size as usize,
+                        )
+                    };
+                    (unsafe { self.perform_rebase(rebase_data, slide) })?;
                 }
                 if dyld_info.bind_size > 0 {
-                    let bind_data = slice::from_raw_parts(
-                        (self.base_addr + dyld_info.bind_off as usize) as *const u8,
-                        dyld_info.bind_size as usize,
-                    );
-                    self.perform_bind(bind_data, slide, libraries, cache)?;
+                    let bind_data = unsafe {
+                        slice::from_raw_parts(
+                            (self.base_addr + dyld_info.bind_off as usize) as *const u8,
+                            dyld_info.bind_size as usize,
+                        )
+                    };
+                    (unsafe { self.perform_bind(bind_data, slide, libraries, cache) })?;
                 }
             }
         }
@@ -68,7 +70,7 @@ impl<'a> MachOContext<'a> {
         data: &[u8],
         slide: usize,
         libraries: &[MachOContext<'a>],
-        _cache: &SharedCache,
+        _cache: Option<&SharedCache>,
     ) -> Result<(), &'static str> {
         let mut cursor = 0;
         let mut seg_offset = 0;
@@ -92,7 +94,7 @@ impl<'a> MachOContext<'a> {
                     while data[cursor] != 0 {
                         cursor += 1;
                     }
-                    symbol_name = core::str::from_utf8_unchecked(&data[start..cursor]);
+                    symbol_name = unsafe { core::str::from_utf8_unchecked(&data[start..cursor]) };
                     cursor += 1; // skip NULL
                 }
                 0x50 => {}
@@ -110,43 +112,51 @@ impl<'a> MachOContext<'a> {
                     seg_offset += decode_uleb128(data, &mut cursor);
                 }
                 0x90 => {
-                    self.bind_at(
-                        segment_address + seg_offset,
-                        symbol_name,
-                        library_ordinal,
-                        libraries,
-                    );
+                    unsafe {
+                        self.bind_at(
+                            segment_address + seg_offset,
+                            symbol_name,
+                            library_ordinal,
+                            libraries,
+                        )
+                    };
                     seg_offset += 8;
                 }
                 0xA0 => {
-                    self.bind_at(
-                        segment_address + seg_offset,
-                        symbol_name,
-                        library_ordinal,
-                        libraries,
-                    );
+                    unsafe {
+                        self.bind_at(
+                            segment_address + seg_offset,
+                            symbol_name,
+                            library_ordinal,
+                            libraries,
+                        )
+                    };
                     seg_offset += decode_uleb128(data, &mut cursor) + 8;
                 }
                 0xB0 => {
-                    self.bind_at(
-                        segment_address + seg_offset,
-                        symbol_name,
-                        library_ordinal,
-                        libraries,
-                    );
+                    unsafe {
+                        self.bind_at(
+                            segment_address + seg_offset,
+                            symbol_name,
+                            library_ordinal,
+                            libraries,
+                        )
+                    };
                     seg_offset += immediate as usize * 8 + 8;
                 }
                 0xC0 => {
                     let count = decode_uleb128(data, &mut cursor);
                     let skip = decode_uleb128(data, &mut cursor);
                     for _ in 0..count {
-                        self.bind_at(
-                            segment_address + seg_offset,
-                            symbol_name,
-                            library_ordinal,
-                            libraries,
-                        );
-                        seg_offset += (skip + 8) as usize;
+                        unsafe {
+                            self.bind_at(
+                                segment_address + seg_offset,
+                                symbol_name,
+                                library_ordinal,
+                                libraries,
+                            )
+                        };
+                        seg_offset += skip + 8;
                     }
                 }
                 _ => return Err("Unknown bind opcode"),
@@ -166,7 +176,7 @@ impl<'a> MachOContext<'a> {
         for lib in libraries {
             if let Some(sym_addr) = lib.find_symbol(name) {
                 let ptr = addr as *mut usize;
-                *ptr = sym_addr;
+                unsafe { *ptr = sym_addr };
                 return;
             }
         }
@@ -204,27 +214,27 @@ impl<'a> MachOContext<'a> {
                 }
                 0x60 => {
                     for _ in 0..immediate {
-                        self.rebase_at(segment_address + seg_offset, slide);
+                        unsafe { self.rebase_at(segment_address + seg_offset, slide) };
                         seg_offset += 8;
                     }
                 }
                 0x70 => {
                     let count = decode_uleb128(data, &mut cursor);
                     for _ in 0..count {
-                        self.rebase_at(segment_address + seg_offset, slide);
+                        unsafe { self.rebase_at(segment_address + seg_offset, slide) };
                         seg_offset += 8;
                     }
                 }
                 0x80 => {
-                    self.rebase_at(segment_address + seg_offset, slide);
+                    unsafe { self.rebase_at(segment_address + seg_offset, slide) };
                     seg_offset += immediate as usize * 8 + 8;
                 }
                 0x90 => {
                     let count = decode_uleb128(data, &mut cursor);
                     let skip = decode_uleb128(data, &mut cursor);
                     for _ in 0..count {
-                        self.rebase_at(segment_address + seg_offset, slide);
-                        seg_offset += (skip + 8) as usize;
+                        unsafe { self.rebase_at(segment_address + seg_offset, slide) };
+                        seg_offset += skip + 8;
                     }
                 }
                 _ => return Err("Unknown rebase opcode"),
