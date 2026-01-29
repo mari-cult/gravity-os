@@ -16,6 +16,7 @@ mod scheduler;
 mod uart;
 mod vfs;
 mod virtio;
+mod zalloc;
 
 use crate::scheduler::{Process, SCHEDULER};
 use alloc::string::String;
@@ -36,14 +37,20 @@ pub extern "C" fn kmain() {
 
     mmu::init();
 
-    heap::init_heap();
+    unsafe extern "C" {
+        static _end: u8;
+    }
+
+    let kernel_end = unsafe { &_end as *const u8 as u64 };
+    let heap_start = (kernel_end + 0x1FFFFF) & !0x1FFFFF; // Align to 2MB
+    let heap_end = 0x7F00_0000u64; // Leave 16MB for stack at the top of 1GB RAM
+    let heap_size = (heap_end - heap_start) as usize;
+
+    heap::init_heap(heap_start, heap_size);
 
     kprintln!("Heap initialized");
 
     kprintln!("Vectors initialized");
-
-    // Initialize virtio block device and load shared cache
-    // let mut shared_cache_data: &[u8] = &[];
 
     if let Some(blk) = virtio::init() {
         kprintln!("Initializing VFS from disk...");
@@ -51,37 +58,31 @@ pub extern "C" fn kmain() {
         let hfsfs = hfsfs::HfsFs::new(blk_shared, 400 * 1024 * 1024);
         vfs::init(hfsfs);
         kprintln!("VFS initialized");
+        load_and_map_shared_cache();
     } else {
         kprintln!("No virtio disk found");
     }
 
     // Note: 0x40000000 seems to be used by dyld for CommPage or similar absolute reference.
-    // We move the app to 0x4000_0000.
     let load_offset = 0x3FFF_F000;
     kprintln!("Using load_offset: {:x}", load_offset);
 
     // Populate CommPage (0xFFFF0000) with shared cache address (0x30000000)
-    // Offset 0x28 commonly used for shared cache base in Darwin ARM
     unsafe {
-        // Signature "comm" at 0x0?
         crate::mmu::COMMPAGE_STORAGE[0] = b'c';
         crate::mmu::COMMPAGE_STORAGE[1] = b'o';
         crate::mmu::COMMPAGE_STORAGE[2] = b'm';
         crate::mmu::COMMPAGE_STORAGE[3] = b'm';
 
-        // Set version at 0x1E (u16)
         let version_ptr = &mut crate::mmu::COMMPAGE_STORAGE[0x1E] as *mut u8 as *mut u16;
         *version_ptr = 13;
 
-        // Set ncpus at 0x22 (u8)
         crate::mmu::COMMPAGE_STORAGE[0x22] = 1;
 
-        // Set pagesize at 0x24 (u32)
         let pgsize_ptr = &mut crate::mmu::COMMPAGE_STORAGE[0x24] as *mut u8 as *mut u32;
         *pgsize_ptr = 4096;
 
         let sc_addr = 0x3000_0000u32;
-        // Try all common shared cache base offsets in CommPage
         for offset in [0x28, 0x38, 0x68, 0x70, 0x88, 0x90] {
             let sc_ptr = &mut crate::mmu::COMMPAGE_STORAGE[offset] as *mut u8 as *mut u32;
             *sc_ptr = sc_addr;
@@ -99,83 +100,179 @@ pub extern "C" fn kmain() {
         kprintln!("Reading /sbin/launchd ({} bytes)...", file.size());
         file.read_to_end()
     };
-    kprintln!("Opening /usr/lib/dyld...");
-    let dyld_bin = {
-        let mut file = vfs::open("/usr/lib/dyld").expect("Failed to open dyld");
-        kprintln!("Reading /usr/lib/dyld ({} bytes)...", file.size());
-        file.read_to_end()
-    };
+
+    // Try to load dyld from VFS first (the 32-bit one from rootfs),
+    // fallback to embedded 64-bit rust dyld if not found or if needed.
+    let mut dyld_bin = None;
+    if let Some(mut file) = vfs::open("/usr/lib/dyld") {
+        kprintln!("Found system dyld at /usr/lib/dyld (size {})", file.size());
+        dyld_bin = Some(file.read_to_end());
+    }
+
+    let dyld_bin = dyld_bin.expect("Failed to load dyld");
+
     kprintln!("Parsing Mach-O binaries...");
-    let main_load_offset = 0; // Use linked address for launchd if possible
-    let main_loader = macho::MachOLoader::load(&main_bin, main_load_offset);
+
+    // Check if main binary is PIE and needs to be slid
+    let mut main_load_offset = 0;
+
+    // Temporary load to check flags
+    if let Some(temp_loader) = macho::BinaryLoader::load(&main_bin, 0) {
+        if (temp_loader.flags & 0x200000) != 0 {
+            // MH_PIE
+            kprintln!("Main binary is PIE. Sliding to 0x40000000 to avoid Page Zero.");
+            main_load_offset = 0x40000000;
+        } else {
+            kprintln!("Main binary is NOT PIE. Loading at 0.");
+        }
+    }
+
+    let main_loader = macho::BinaryLoader::load(&main_bin, main_load_offset);
     if let Some(loader) = main_loader {
         let mut loader_is_64bit = loader.is_64bit;
-        let (entry, path, dyld_mh, _dyld_slide) = if let Some(dyld_path) = loader.dylinker {
+        let (entry, path, dyld_mh, main_mh, _dyld_slide) = if let Some(dyld_path) = loader.dylinker
+        {
             kprintln!("Binary requests dylinker: {}", dyld_path);
-            let dyld_load_offset = 0x2fe00000;
+            let dyld_load_offset = 0;
             let dyld_loader =
-                macho::MachOLoader::load(&dyld_bin, dyld_load_offset).expect("Failed to load dyld");
+                macho::BinaryLoader::load(dyld_bin, dyld_load_offset).expect("Failed to load dyld");
             loader_is_64bit = dyld_loader.is_64bit;
-            (dyld_loader.entry, dyld_path, dyld_loader.header_addr, 0)
+            (
+                dyld_loader.entry,
+                String::from("/sbin/launchd"),
+                dyld_loader.header_addr,
+                loader.header_addr,
+                0,
+            )
         } else {
             (
                 loader.entry + main_load_offset,
-                String::from("/bin/initial"),
-                0,
+                String::from("/sbin/launchd"),
+                loader.header_addr,
+                loader.header_addr,
                 0,
             )
         };
 
-        // Allocate and map user stack
         let (user_stack_base, user_sp_initial, user_stack_size) = {
             let size = 1024 * 1024;
-            let buf = vec![0u8; size];
-            let base = buf.as_ptr() as u64;
-            core::mem::forget(buf);
-            (base, base + size as u64, size)
+            // Move stack to 0x20000000 (512MB)
+            let stack_addr = 0x20000000u64;
+            let layout = core::alloc::Layout::from_size_align(size, 4096).unwrap();
+            let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+            if ptr.is_null() {
+                panic!("Failed to allocate stack");
+            }
+            // Use ptr as backing, but map to stack_addr
+            let paddr = ptr as u64;
+            (stack_addr, stack_addr + size as u64, size)
         };
-        crate::mmu::map_range(
-            user_stack_base,
-            user_stack_base,
-            user_stack_size as u64,
-            crate::mmu::MapPermission::UserRW,
-        );
+        // Allocate physical memory for stack and map it
+        {
+            let layout = core::alloc::Layout::from_size_align(user_stack_size, 4096).unwrap();
+            let phys_ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+            if phys_ptr.is_null() {
+                panic!("Failed to allocate physical stack");
+            }
+            crate::mmu::map_range(
+                user_stack_base,
+                phys_ptr as u64,
+                user_stack_size as u64,
+                crate::mmu::MapPermission::UserRW,
+            );
+        }
 
-        // Setup BSD/Mach stack layout
+        // HACK: dyld accesses 5 * SP. Map it.
+        let mystery_addr = user_stack_base * 5;
+        kprintln!("Mapping mystery region at {:x}...", mystery_addr);
+        {
+            // Map 16MB to be safe (FAR was at ~5MB offset) we use 2MB alignment for speed
+            let size = 16 * 1024 * 1024;
+            let layout = core::alloc::Layout::from_size_align(size, 0x200000).unwrap();
+            let phys_ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+            crate::mmu::map_range(
+                mystery_addr,
+                phys_ptr as u64,
+                size as u64,
+                crate::mmu::MapPermission::UserRW,
+            );
+        }
+
+        // Map Page Zero (0x0 - 0x10000) - 64KB to handle low jumps
+        {
+            let size = 64 * 1024;
+            let layout = core::alloc::Layout::from_size_align(size, 4096).unwrap();
+            let phys_ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+
+            crate::mmu::map_range(
+                0,
+                phys_ptr as u64,
+                size as u64,
+                crate::mmu::MapPermission::UserRW,
+            );
+        }
+
+        // Map Mystery Region 2 (0x08000000)
+        // dyld accesses 0x0859454c.
+        {
+            let addr = 0x08000000;
+            let size = 16 * 1024 * 1024;
+            let layout = core::alloc::Layout::from_size_align(size, 0x200000).unwrap();
+            let phys_ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+            crate::mmu::map_range(
+                addr,
+                phys_ptr as u64,
+                size as u64,
+                crate::mmu::MapPermission::UserRW,
+            );
+        }
+
         kprintln!("Initial User SP: {:x}", user_sp_initial);
-        // Pass the actual address where the Mach-O header was loaded (mapped)
-        let new_sp =
-            macho::setup_stack(user_sp_initial, &path, loader.header_addr, loader_is_64bit);
+        let new_sp = macho::setup_stack(
+            user_sp_initial,
+            &path,
+            dyld_mh,
+            loader_is_64bit,
+            0x30000000,
+            main_mh,
+        );
         kprintln!("Stack setup complete. New User SP: {:x}", new_sp);
 
-        // Prepare args for dyld bootstrap:
-        // Darwin ARMv7: r0=dyld_mh, r1=slide, r2=&argc, r3=argv, r4=envp, r5=apple
         let args = if loader_is_64bit {
             [
                 loader.header_addr,
-                0, // slide
+                0,
                 new_sp + 8,
                 new_sp + 16,
                 new_sp + 32,
                 new_sp + 40,
             ]
         } else {
-            [
-                dyld_mh,     // r0: dyld's own mach_header
-                0,           // r1: dyld's own slide
-                new_sp + 4,  // r2: &argc (sp+4 points to argc=1)
-                new_sp + 8,  // r3: argv
-                new_sp + 16, // r4: envp
-                new_sp + 20, // r5: apple
-            ]
+            // AArch32: sp points to argc.
+            // macho::setup_stack handled the vector layout.
+            // We just need to tell the thread to start with sp.
+            // The registers r0, r1 etc are usually for specific dyld entry.
+            // In modern dyld:
+            // r0 = mach_header of main app? No, r0 is 0 usually.
+            // sp points to argc.
+            // Actually, if dyld is dynamic linker, kernel entry:
+            // sp -> argc
+            // But we are setting registers for Process::new.
+            // Process::new sets x0...x7 from args array.
+            // For dyld start:
+            // x0 = 0
+            // x1 = 0
+            // x2 = 0
+            // x3 = 0
+            // sp = new_sp
+            // So we need clear args.
+            [0, 0, 0, 0, 0, 0]
         };
 
-        // Allocate TLS page (4KB), ensuring 4KB alignment
         let (tls_base, tls_size) = {
             let size = 4096;
-            use alloc::alloc::{Layout, alloc_zeroed};
-            let layout = Layout::from_size_align(size, 4096).unwrap();
-            let ptr = unsafe { alloc_zeroed(layout) };
+            let layout = core::alloc::Layout::from_size_align(size, 4096).unwrap();
+            let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
             if ptr.is_null() {
                 panic!("Failed to allocate TLS");
             }
@@ -188,7 +285,6 @@ pub extern "C" fn kmain() {
             crate::mmu::MapPermission::UserRW,
         );
         kprintln!("Mapped TLS at {:x}", tls_base);
-        // Fill TLS with self-reference at offset 0
         unsafe {
             core::ptr::write(tls_base as *mut u32, tls_base as u32);
         }
@@ -232,17 +328,131 @@ pub extern "C" fn kmain() {
             fn __switch_to(prev: *mut process::CpuContext, next: *const process::CpuContext);
         }
         __switch_to(&mut boot_ctx, next_ctx_ptr);
-
-        kprintln!("ERROR: __switch_to returned to kmain!");
     }
-
-    kprintln!(
-        "Returned to kmain loop? This shouldn't happen for the first switch unless it returns."
-    );
 
     loop {
         unsafe { asm!("wfe") };
     }
+}
+
+fn load_and_map_shared_cache() {
+    let sc_paths = [
+        "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_armv7",
+        "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_armv6",
+    ];
+
+    let mut sc_file = None;
+    for path in sc_paths {
+        if let Some(file) = vfs::open(path) {
+            kprintln!("Found shared cache at {}", path);
+            sc_file = Some(file);
+            break;
+        }
+    }
+
+    let mut file = match sc_file {
+        Some(f) => f,
+        None => {
+            kprintln!("Shared cache NOT found in HFS+ volume");
+            return;
+        }
+    };
+
+    let size = file.size();
+    kprintln!("Shared cache size: {} bytes", size);
+
+    // Read header for debug
+    let mut header = [0u8; 128];
+    file.read_at(0, &mut header);
+
+    kprintln!("Shared cache header dump:");
+    for i in 0..8 {
+        let offset = i * 16;
+        kprintln!(
+            "  {:02x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+            offset,
+            header[offset],
+            header[offset + 1],
+            header[offset + 2],
+            header[offset + 3],
+            header[offset + 4],
+            header[offset + 5],
+            header[offset + 6],
+            header[offset + 7],
+            header[offset + 8],
+            header[offset + 9],
+            header[offset + 10],
+            header[offset + 11],
+            header[offset + 12],
+            header[offset + 13],
+            header[offset + 14],
+            header[offset + 15]
+        );
+    }
+
+    if let Ok(magic) = core::str::from_utf8(&header[0..16]) {
+        kprintln!("Shared cache header magic: {:?}", magic);
+    }
+    let base_addr = u64::from_le_bytes(header[32..40].try_into().unwrap_or([0; 8]));
+    kprintln!("Shared cache expected base address: {:x}", base_addr);
+
+    let mapping_offset = u32::from_le_bytes(header[16..20].try_into().unwrap_or([0; 4])) as u64;
+    let mapping_count = u32::from_le_bytes(header[20..24].try_into().unwrap_or([0; 4])) as usize;
+    kprintln!(
+        "Shared cache mappings: count={} offset={:x}",
+        mapping_count,
+        mapping_offset
+    );
+
+    // Dump mappings
+    let mut mapping_buf = [0u8; 32]; // Each mapping is 32 bytes
+    for i in 0..mapping_count {
+        file.read_at(mapping_offset + (i * 32) as u64, &mut mapping_buf);
+        let address = u64::from_le_bytes(mapping_buf[0..8].try_into().unwrap());
+        let size = u64::from_le_bytes(mapping_buf[8..16].try_into().unwrap());
+        let file_offset = u64::from_le_bytes(mapping_buf[16..24].try_into().unwrap());
+        kprintln!(
+            "  Mapping {}: addr={:x} size={:x} file_off={:x}",
+            i,
+            address,
+            size,
+            file_offset
+        );
+    }
+
+    // Allocate physical memory for shared cache from heap (must be page aligned)
+    let alloc_size = (size as usize + 4095) & !4095;
+    let layout = core::alloc::Layout::from_size_align(alloc_size, 4096).unwrap();
+    let phys_ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if phys_ptr.is_null() {
+        kprintln!("Failed to allocate memory for shared cache!");
+        return;
+    }
+
+    kprintln!(
+        "Loading shared cache into memory at {:x}...",
+        phys_ptr as usize
+    );
+    let mut loaded = 0;
+    while loaded < size as usize {
+        let chunk_size = core::cmp::min(1024 * 1024, size as usize - loaded);
+        let slice = unsafe { core::slice::from_raw_parts_mut(phys_ptr.add(loaded), chunk_size) };
+        file.read(slice);
+        loaded += chunk_size;
+        if loaded % (50 * 1024 * 1024) == 0 {
+            kprintln!("  Loaded {} MB...", loaded / 1024 / 1024);
+        }
+    }
+
+    let sc_base = 0x3000_0000u64;
+    kprintln!("Mapping shared cache to vaddr {:x}...", sc_base);
+    crate::mmu::map_range(
+        sc_base,
+        phys_ptr as u64,
+        alloc_size as u64,
+        crate::mmu::MapPermission::UserRWX, // Initially RWX for dyld
+    );
+    kprintln!("Shared cache mapped successfully.");
 }
 
 #[panic_handler]

@@ -10,3 +10,4 @@ compile_commands.json
 /work
 /result
 /result-*
+src/kernel/src/rust_dyld.bin

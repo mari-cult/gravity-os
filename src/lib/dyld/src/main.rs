@@ -32,14 +32,14 @@ use alloc::vec::Vec;
 pub struct DyldState<'a> {
     pub main_executable: MachOContext<'a>,
     pub libraries: Vec<MachOContext<'a>>,
-    pub cache: SharedCache,
+    pub cache: Option<SharedCache>,
 }
 
 impl<'a> DyldState<'a> {
     /// # Safety
     ///
     /// `mh` must be a valid pointer to a Mach-O header.
-    pub unsafe fn new(mh: *const u8, slide: usize, cache: SharedCache) -> Self {
+    pub unsafe fn new(mh: *const u8, slide: usize, cache: Option<SharedCache>) -> Self {
         let main_ctx =
             unsafe { MachOContext::parse(mh, slide).expect("Failed to parse main Mach-O") };
         Self {
@@ -51,12 +51,11 @@ impl<'a> DyldState<'a> {
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = "__TEXT,__text")]
 /// # Safety
 ///
 /// Entry point for the dynamic linker.
 /// Pointers must be valid.
-pub unsafe extern "C" fn dyld_start(
+pub unsafe extern "C" fn dyld_entry(
     mh: *const u8,
     slide: usize,
     argc_ptr: *const u64,
@@ -87,10 +86,14 @@ pub unsafe extern "C" fn dyld_start(
         let sc_base = 0x30000000usize;
         // TODO: Parse apple_ptr to find dyld_shared_cache_base_address
 
-        let cache = SharedCache::from_addr(sc_base).expect("Failed to find shared cache");
-        print("Shared cache found at ");
-        print_hex(sc_base as u64);
-        print("\n");
+        let cache = SharedCache::from_addr(sc_base);
+        if let Some(c) = &cache {
+            print("Shared cache found at ");
+            print_hex(sc_base as u64);
+            print("\n");
+        } else {
+            print("Shared cache NOT found (optional)\n");
+        }
 
         let mut state = DyldState::new(mh, slide, cache);
 
@@ -110,17 +113,21 @@ pub unsafe extern "C" fn dyld_start(
                 print(name);
                 print("\n");
 
-                if let Some(dylib_addr) = state.cache.find_dylib(name) {
-                    print("  Found in cache at ");
-                    print_hex(dylib_addr as u64);
-                    print("\n");
-                    // Parse and add to state
-                    if let Some(lib_ctx) = MachOContext::parse(dylib_addr, 0) {
-                        // Slide 0 for cache?
-                        state.libraries.push(lib_ctx);
+                if let Some(cache) = &state.cache {
+                    if let Some(dylib_addr) = cache.find_dylib(name) {
+                        print("  Found in cache at ");
+                        print_hex(dylib_addr as u64);
+                        print("\n");
+                        // Parse and add to state
+                        if let Some(lib_ctx) = MachOContext::parse(dylib_addr, 0) {
+                            // Slide 0 for cache?
+                            state.libraries.push(lib_ctx);
+                        }
+                    } else {
+                        print("  NOT found in cache\n");
                     }
                 } else {
-                    print("  NOT found in cache\n");
+                    print("  Shared cache missing, cannot load dylib\n");
                 }
             }
         }
@@ -128,7 +135,7 @@ pub unsafe extern "C" fn dyld_start(
         // Apply relocations
         state
             .main_executable
-            .apply_relocations(&state.libraries, &state.cache)
+            .apply_relocations(&state.libraries, state.cache.as_ref())
             .expect("Failed to apply relocations");
 
         print("Jumping to entry point: ");
@@ -141,7 +148,7 @@ pub unsafe extern "C" fn dyld_start(
 
         loop {
             // For now, just yield or hang
-            core::arch::asm!("svc #0", in("x8") 0u64);
+            core::arch::asm!("svc #0", in("x8") 0u64, options(nostack, noreturn));
         }
     }
 }

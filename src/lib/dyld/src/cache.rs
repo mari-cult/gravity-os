@@ -25,6 +25,14 @@ pub struct SharedCache {
 
 impl SharedCache {
     pub unsafe fn from_addr(addr: usize) -> Option<Self> {
+        if addr == 0 {
+            return None;
+        }
+
+        // TODO: Map the shared cache in kernel and validate it here.
+        // For now, returning None avoids a data abort if 0x30000000 is not mapped.
+        None
+        /*
         let header = &*(addr as *const DyldCacheHeader);
         if &header.magic[0..4] != b"dyld" {
             return None;
@@ -32,6 +40,7 @@ impl SharedCache {
         Some(Self {
             base_addr: addr as *const u8,
         })
+        */
     }
 
     pub unsafe fn find_dylib(&self, path: &str) -> Option<*const u8> {

@@ -25,14 +25,14 @@ real_start:
     /* Initialize BSS */
     ldr x0, =__bss_start
     ldr x1, =__bss_end
-    sub x1, x1, x0
-    cbz x1, 2f
+    cmp x0, x1
+    bge 2f
 
     /* Zero out BSS */
 zero_bss:
     str xzr, [x0], #8
-    sub x1, x1, #8
-    cbnz x1, zero_bss
+    cmp x0, x1
+    blt zero_bss
 
 2:
     /* Enable FPU/SIMD */
@@ -42,7 +42,7 @@ zero_bss:
 
     /* Jump to Rust code */
     /* Set stack pointer before jump */
-    ldr x0, =0x40800000
+    ldr x0, =0x80000000
     mov sp, x0
     bl  kmain
 
